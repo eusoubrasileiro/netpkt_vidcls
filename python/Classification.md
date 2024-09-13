@@ -23,3 +23,11 @@ Ignoring broadcast address (router) 192.168.0.1.
 ### Training and Classification
 
 For creating training data use a specific local machine, no mix of clients. For classification use the lan router local network interface and many clients can be classified at once at every 5 seconds. 
+
+
+### Lessons Learned
+
+Model so far with ExtraTrees (default parameters) is getting aroung 93% mean accuracy with 10 seconds window. 
+Using smaller windows decrease accuracy. Removing entropy features also decreases accuracy. 
+Already selected the best first 11 features. 
+
