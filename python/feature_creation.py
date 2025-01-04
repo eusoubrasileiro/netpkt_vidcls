@@ -2,11 +2,19 @@ import struct
 import socket
 import numpy as np
 import pandas as pd
-
+from joblib import load
 
 config = {}
-config['selected_features'] = ['ack_entropy', 'ttl_entropy', 'tcp_ack_var', 'pkt_entropy', 
-                     'udp_nports', 'dw_ttl_avg', 'dw_ttl_unique']
+config['selected_features'] = ['ack_entropy',
+                            'ttl_entropy',
+                            'tcp_ack_var',
+                            'udp_nports',
+                            'pkt_entropy',
+                            'dw_pkt_avg',
+                            'dw_ttl_avg',
+                            'dw_ttl_unique',
+                            'dw_pkt_entropy',
+                            'dl_pkt_avg']
 
 config['lan-subnet'] = '192.168.0.0'
 config['lan-subnet-mask'] = 24
@@ -15,6 +23,7 @@ config['window-size'] = 10
 
 config['path'] = {}
 config['path']['raw'] = '/home/andre/Projects/netpkt_vidcls/python/data/raw.h5'
+config['model'] = '/home/andre/Projects/netpkt_vidcls/python/etree.joblib'
 
 def update_hdf(df):
     dfdisk = pd.read_hdf(config['path']['raw'])
@@ -25,20 +34,15 @@ def read_hdf():
     df = pd.read_hdf(config['path']['raw'])
     return df
 
-def csv_preprocess(path):
-    """
-    Function to preprocess tcpdump raw tcp header data read from csv file   
-    Args:
-        path (str): path to csv file created from scapy_sniffer.py on training mode
-    """
+def load_model():    
+    model = load(config['model'])
+    return model
 
-    df = pd.read_csv(path)
 
-    # 'time' column is in seconds (Unix timestamp) 
-    # no sure this is needed 
-    df['dttime'] = pd.to_datetime(df['time'], unit='s')
-    # Set time as index for easier resampling
-    df.set_index(pd.to_datetime(df['time'], unit='s'), inplace=True)    
+def preprocess(df):
+    """
+    Function to preprocess tcpdump raw tcp header data
+    """
 
     # Function to convert IP string to integer
     def ip_to_int(ip):
@@ -81,12 +85,23 @@ def csv_preprocess(path):
     return df
 
 
+def csv_preprocess(path):
+    """
+        Function to preprocess tcpdump raw tcp header data read from csv file   
+    Args:
+        path (str): path to csv file created from scapy_sniffer.py on training mode
+    """
+    df = pd.read_csv(path)
+
+    return preprocess(df)
+
+
 def make_windowed_features(df):
 
     # Set time as index
     # needed for resample bellow
-    df.set_index(pd.to_datetime(df['time'], unit='s'), inplace=True)
-    df.sort_index(inplace=True)
+    df['dttime'] = pd.to_datetime(df['time'], unit='s')
+    df.set_index('dttime', inplace=True)
     # Now group by the window (resample) and calculate features
     grouped = df.resample(f'{config["window-size"]}s')
 

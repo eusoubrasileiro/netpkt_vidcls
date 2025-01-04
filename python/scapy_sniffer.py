@@ -1,11 +1,25 @@
+"""
+sudo su 
+rm /tmp/packet_capture.pcap 
+mkfifo /tmp/packet_capture.pcap
+tcpdump -i eno1 -w /tmp/packet_capture.pcap 
+"""
+
 import argparse
 import os
 import sys
+import joblib
+import numpy as np 
 import datetime
 from scapy.all import PcapReader, IP, TCP, UDP
 import pandas as pd
 from pathlib import Path
-from feature_creation import make_windowed_features, selected_features
+from feature_creation import (
+    make_windowed_features, 
+    config,
+    load_model,
+    preprocess
+)
 
 def process_packet(packet):
     """Process individual packet to extract relevant fields."""
@@ -16,7 +30,7 @@ def process_packet(packet):
         'src_ip': ip_layer.src,
         'dst_ip': ip_layer.dst,
         'packet_size': ip_layer.len,
-        'time': packet.time,
+        'time': float(packet.time),
         'identification': ip_layer.id,
         'ttl': ip_layer.ttl,
         'ip_flags': str(ip_layer.flags) if ip_layer.flags else "NONE",
@@ -51,8 +65,7 @@ def get_pcap_reader(source):
 
 def main():
     parser = argparse.ArgumentParser(description="Network traffic sniffer and feature extractor.")
-    parser.add_argument("--train", action="store_true", help="Record data for model training.")
-    parser.add_argument("--features", nargs='+', default=selected_features, help="Features to compute.")
+    parser.add_argument("--train", action="store_true", default=False, help="Record data for model training.")    
     parser.add_argument("--verbose", action="store_true", help="Print packet details during training.")
     parser.add_argument("--source", type=str, default="stdin", help="Input source: 'stdin' or path to named pipe (FIFO).")
     args = parser.parse_args()
@@ -60,6 +73,10 @@ def main():
     # Verify source if not stdin
     if args.source != "stdin" and not os.path.exists(args.source):
         raise FileNotFoundError(f"The specified source '{args.source}' does not exist.")
+    
+    if not args.train:        
+        print("Starting inference...")
+        model = load_model()
 
     data = []
     start_time = datetime.datetime.now()
@@ -84,18 +101,21 @@ def main():
                 elapsed = (datetime.datetime.now() - start_time).total_seconds()
                 if elapsed >= 10:  # Process every 10 seconds                
                     if not args.train:
-                        features, _ = make_windowed_features(df)
-                        features = features[args.features]
-                        print(features)  # or integrate with a model for real-time predictions                    
+                        X = make_windowed_features(preprocess(pd.DataFrame(data)))
+                        X = X[config['selected_features']]                        
+                        y = model.predict_proba(X)
+                        n = y.shape[0]
+                        y = np.sum(y, axis=0)/n  # average the predictions (in case more then 1 prediction is made)
+                        print(f"You are {100*y[1]:3.0f}% likely to be watching a video. And {100*y[0]:3.0f}% likely to be working")
                         data.clear()
-                start_time = datetime.datetime.now()
+                    start_time = datetime.datetime.now()
                
     except KeyboardInterrupt: # If the user interrupts the script, save the data
         if args.train:
             df = pd.DataFrame(data)
             df.to_csv(f"training_data_{start_time.isoformat(timespec='minutes')}.csv", index=False)
             print(f"Recorded {len(data)} packets for training.")
-            
+
     print('No more data to process')
 
 
