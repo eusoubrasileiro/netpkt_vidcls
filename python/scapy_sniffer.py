@@ -106,7 +106,11 @@ def main():
                         y = model.predict_proba(X)
                         n = y.shape[0]
                         y = np.sum(y, axis=0)/n  # average the predictions (in case more then 1 prediction is made)
-                        print(f"You are {100*y[1]:3.0f}% likely to be watching a video. And {100*y[0]:3.0f}% likely to be working")
+                        # cuttoff at 50% 
+                        if y[1] > 0.5:
+                            print(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} You are watching a video. Score: {100*y[1]:3.0f}%")
+                        else:
+                            print(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} You are NOT watching a video. Score: {100*y[0]:3.0f}%")
                         data.clear()
                     start_time = datetime.datetime.now()
                

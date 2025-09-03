@@ -1,20 +1,33 @@
 ### Real-Time Network Packet Analysis for Video Streaming Identification
 
-**Initial Goal:**
+The goal is to limit excessive video streaming and social media usage on my home network.  
+We could theoretically achieve this by analyzing network packet traffic (libpcap, tcpdump).  
+Initially tought about using C and running directly on my OpenWrt router. 
+But for start it's easier to somehow redirect the traffic to a SBC (orangepi5 etc or another).
+There classify the source ip on our network and if it's a streaming traffic and for how long. 
+If streaming and for too long start blacklisting the external-destination ips on dnsmasq.
+Eventually reset every night those ips on dnsmasq.
 
-My initial idea was to limit excessive video streaming and social media usage on my home network. I thought I could achieve this directly from my OpenWrt router using C and analyzing network packet traffic (libpcap, tcpdump).
 
-**Revised Approach:**
+#### Current Status
 
-After some research (mainly discussions with ChatGPT), I realized that packet traffic alone couldn't identify the specific web sources (e.g., Instagram or YouTube). A more comprehensive solution involves combining DNS query logs (dnsmasq) with packet traffic data to train a machine learning classification model (like LSTM or Random Forest).
+So far we have the classification working.
+An ExtraTree model and some features are able to classify the trafic as video streaming or not.
+With 90% of average accuracy on random splitting scenarios with tranining data.
 
-**Current Focus:**
+Current working version was trained:
+     - with 184.9MB of training data 
+     - 8 locally manual classified scenarios 
 
-Since the complete solution is more complex, I'm starting with a simpler goal: identifying video streaming traffic using network packet data and Python for classication using sklearn.
+We can run it with bellow specifiying the interface `-i eno1` is the name bellow
 
-**Key Points:**
+```bash
+sudo tcpdump -i eno1 -s 1024 -w - port 80 or port 443 | python3 scapy_sniffer.py --verbose 
+```
 
-* This project aims to analyze network traffic in real-time to identify video streams.
-* The initial plan to rely on packet traffic on local linux machine using Python.
-* For the future maybe try something that integrates direct to the router, or use a orangepi boar, and incorporate DNS query logs for more accurate source classification.
+##### Future ideas
+
+###### Classification 
+
+-  Try incorporate DNS query logs for more accurate source classification.
 

@@ -1,3 +1,7 @@
+TODO: rewrite this somewhere else maybe not here...
+
+this seems to be the overal plan I should think and rewrite/complete this
+
 ### Indentifiying/Classifing video streaming traffic features for classification.
 
 First identify clients on my LAN (local network). 
