@@ -4,7 +4,7 @@ To create training samples data files
 sudo tcpdump -i wlp2s0 -s 1024 -w - port 80 or port 443 | python3 scapy_sniffer.py --train > youtube_packets_01.txt
 ```
 
-- List of training Data
+#### List of training Data
 
 Files parsed already ingested by raw.h5 pandas dataframe:
 
@@ -17,3 +17,9 @@ Files parsed already ingested by raw.h5 pandas dataframe:
 - insta_packets_01.txt web activities: instagram scrolling and videos
 - insta_packets_02.txt web activities: instagram scrolling and videos
 
+
+
+#### Needed 
+
+
+- Audio streaming (audible, spotify, pilgrim) only to classify as not video streaming

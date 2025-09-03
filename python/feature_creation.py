@@ -22,7 +22,7 @@ config['lan-subnet-mask'] = 24
 config['window-size'] = 10 
 
 config['path'] = {}
-config['path']['raw'] = '/home/andre/Projects/netpkt_vidcls/python/data/raw.h5'
+config['path']['raw'] = '/home/andre/Projects/netpkt_vidcls/python/training/raw.h5'
 config['model'] = '/home/andre/Projects/netpkt_vidcls/python/etree.joblib'
 
 def update_hdf(df):
