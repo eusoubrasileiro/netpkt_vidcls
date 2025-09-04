@@ -45,6 +45,7 @@ sudo tcpdump -i eno1 -s 1024 -w - port 80 or port 443 | python3 scapy_sniffer.py
 ##### Real Time Classification
 
 Use 3 consecutive classes 1 classifications as a trigger. (30 seconds window)
+Also use class 1 threshold of 70% to classify as real streaming. 
 For registering an ip in a state of watching a the video streaming. 
 And to remove it from the video streaming state another 3 classes 0. 
 
@@ -60,7 +61,14 @@ ssh -o ServerAliveInterval=30 root@$OPENWRT_IP \
 | python3 scapy_sniffer.py --verbose
 ```
 
+#### TODO
 
+1. Create blocker.py to manage a local JSON file with client states. 
+If 3 consecutive flags for one client put it on streaming state and start to count its time.
+If it reaches the quota limit specified in `config['streaming-limit-seconds']` start writting the server ips on a txt. 
+One per time, at every new call to blocker add another one, starting from the ones with highest traffic to the ones to the lowest traffic. 
+That gives time for the client to move to another state and lettings us block only video streaming server ips. 
+2. Create a tiny static python? server to serve real time logs and client states and time quota.
 
 ##### Future Ideas
 

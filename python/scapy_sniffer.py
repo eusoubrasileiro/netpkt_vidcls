@@ -27,9 +27,9 @@ from datetime import datetime
 from scapy.all import PcapReader, IP, TCP, UDP
 import pandas as pd
 from pathlib import Path
+from config import config
 from feature_creation import (
     make_windowed_features, 
-    config,
     load_model,
     preprocess
 )
@@ -131,7 +131,7 @@ def main():
                                     y_proba = model.predict_proba(client_features)
                                     avg_proba = np.mean(y_proba, axis=0)
                                     
-                                    is_streaming = avg_proba[1] > 0.5
+                                    is_streaming = avg_proba[1] > config['class-1-threshold']
 
                                     # Aggregate all server IPs for this client from all their time windows
                                     server_ips = set()
@@ -139,6 +139,9 @@ def main():
                                         server_ips.update(client_data['server'].unique().tolist())
                                     
                                     # Update the blocker with the client's current status
+                                    # TODO: only if 3 consecutive classes 1 to 
+                                    # also if 3 consecutive classes 0 to remove from streaming state
+                                    # that is blocker worker tough... not for here ...
                                     # blocker.update_client_status(client_ip, is_streaming, list(server_ips))
 
                                     # Log the current activity
@@ -154,7 +157,7 @@ def main():
                                         f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
                                         f"Client: {client_ip:<15} | Status: {client_status:<7} | "
                                         f"Activity: {status_msg:<15} | "
-                                        f"Score: {score:3.0f}%"
+                                        f"Score/Threshold: {score:3.0f}%/{config['class-1-threshold']*100:3.0f}%"
                                     )
                         
                         data.clear()  # Clear data after processing
