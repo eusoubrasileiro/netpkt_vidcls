@@ -107,7 +107,6 @@ def main():
                 elapsed = (datetime.datetime.now() - start_time).total_seconds()
                 if elapsed >= 10:  # Process every 10 seconds                
                     if not args.train:
-                        client_ip = most_active_client(data)
                         X = make_windowed_features(preprocess(pd.DataFrame(data)))
                         X = X[config['selected_features']]                        
                         y = model.predict_proba(X)
