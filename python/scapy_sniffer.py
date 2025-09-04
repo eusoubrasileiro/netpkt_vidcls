@@ -1,4 +1,10 @@
 """
+For testing:
+
+sudo tcpdump -i eno1 -s 1024 -w - port 80 or port 443 | python3 scapy_sniffer.py --verbose 
+
+
+For debugging on vscode:
 sudo su 
 rm /tmp/packet_capture.pcap 
 mkfifo /tmp/packet_capture.pcap
@@ -10,7 +16,7 @@ import os
 import sys
 import joblib
 import numpy as np 
-import datetime
+from datetime import datetime
 from scapy.all import PcapReader, IP, TCP, UDP
 import pandas as pd
 from pathlib import Path
@@ -20,6 +26,7 @@ from feature_creation import (
     load_model,
     preprocess
 )
+# from blocker import Blocker
 
 def process_packet(packet):
     """Process individual packet to extract relevant fields."""
@@ -63,12 +70,6 @@ def get_pcap_reader(source):
     else:
         raise FileNotFoundError(f"Specified source '{source}' does not exist.")
 
-def most_active_client(data):
-    """Get the most active client from the data. Using 
-    the client with the highest average upload speed.
-    """
-    pass # TODO: implement this
-
 def main():
     parser = argparse.ArgumentParser(description="Network traffic sniffer and feature extractor.")
     parser.add_argument("--train", action="store_true", default=False, help="Record data for model training.")    
@@ -83,9 +84,10 @@ def main():
     if not args.train:        
         print("Starting inference...")
         model = load_model()
+        #blocker = Blocker() # TODO: uncomment this
 
     data = []
-    start_time = datetime.datetime.now()
+    start_time = datetime.now()
 
     try:
         with get_pcap_reader(args.source) as pcap_reader:
@@ -104,21 +106,53 @@ def main():
                             f"TCP Ack:{packet_data['tcp_ack']:10d} TCP Flags:{packet_data['tcp_flags']}"
                         ))
 
-                elapsed = (datetime.datetime.now() - start_time).total_seconds()
-                if elapsed >= 10:  # Process every 10 seconds                
-                    if not args.train:
-                        X = make_windowed_features(preprocess(pd.DataFrame(data)))
-                        X = X[config['selected_features']]                        
-                        y = model.predict_proba(X)
-                        n = y.shape[0]
-                        y = np.sum(y, axis=0)/n  # average the predictions (in case more then 1 prediction is made)
-                        # cuttoff at 50% 
-                        if y[1] > 0.5:
-                            print(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} You ARE WATCHING A VIDEO streaming. Score: {100*y[1]:3.0f}%")
-                        else:
-                            print(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} You ARE NOT watching A VIDEO streaming. Score: {100*y[0]:3.0f}%")
-                        data.clear()
-                    start_time = datetime.datetime.now()
+                elapsed = (datetime.now() - start_time).total_seconds()
+                if elapsed >= 10:  # Process every 10 seconds
+                    if data:  # only process if there is data
+                        if not args.train:
+                            df_data = preprocess(pd.DataFrame(data))                            
+                            if not df_data.empty:
+                                # Separate feature columns for prediction
+                                feature_cols = config['selected_features']
+                                
+                                # Iterate over each client found in the time window
+                                for client_ip, client_data in df_data.groupby('client'):                                    
+                                    features = make_windowed_features(client_data)
+                                    client_features = features[feature_cols]
+                                    if client_features.empty:
+                                        continue # no features to predict
+                                    y_proba = model.predict_proba(client_features)
+                                    avg_proba = np.mean(y_proba, axis=0)
+                                    
+                                    is_streaming = avg_proba[1] > 0.5
+
+                                    # Aggregate all server IPs for this client from all their time windows
+                                    server_ips = set()
+                                    if 'server' in client_data:
+                                        server_ips.update(client_data['server'].unique().tolist())
+                                    
+                                    # Update the blocker with the client's current status
+                                    # blocker.update_client_status(client_ip, is_streaming, list(server_ips))
+
+                                    # Log the current activity
+                                    status_msg = "IS STREAMING" if is_streaming else "is NOT streaming"
+                                    score = 100 * avg_proba[1] if is_streaming else 100 * avg_proba[0]
+                                    
+                                    # Check if client is currently blocked to reflect in log
+                                    client_status = "ALLOWED"
+                                    # if client_ip in blocker.clients and blocker.clients[client_ip]['is_blocked']:
+                                    #     client_status = "BLOCKED"
+
+                                    print(
+                                        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+                                        f"Client: {client_ip:<15} | Status: {client_status:<7} | "
+                                        f"Activity: {status_msg:<15} | "
+                                        f"Score: {score:3.0f}%"
+                                    )
+                        
+                        data.clear()  # Clear data after processing
+                    
+                    start_time = datetime.now()  # Reset timer
                
     except KeyboardInterrupt: # If the user interrupts the script, save the data
         if args.train:

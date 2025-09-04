@@ -2,6 +2,7 @@ import struct
 import socket
 import numpy as np
 import pandas as pd
+import pathlib
 from joblib import load
 
 config = {}
@@ -22,8 +23,8 @@ config['lan-subnet-mask'] = 24
 config['window-size'] = 10 
 
 config['path'] = {}
-config['path']['raw'] = 'python/training/raw.h5' # relative path to project root
-config['model'] = 'python/etree.joblib'
+config['path']['raw'] = pathlib.Path(__file__).parent / 'training' / 'raw.h5'
+config['model'] = pathlib.Path(__file__).parent / 'etree.joblib'
 
 def update_hdf(df):
     dfdisk = pd.read_hdf(config['path']['raw'])
@@ -104,6 +105,8 @@ def make_windowed_features(df):
     df['dttime'] = pd.to_datetime(df['time'], unit='s')
     df.set_index('dttime', inplace=True)
     # Now group by the window (resample) and calculate features
+    # has no effect on real time classification since it's already grouped by client
+    # and on 10 seconds window
     grouped = df.resample(f'{config["window-size"]}s')
 
     def entropy(df, colname):        
