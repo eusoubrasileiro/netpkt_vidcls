@@ -8,12 +8,8 @@ Ignoring broadcast address (router) 192.168.0.1.
 
 1. Is there packets?
 2. Identify all clients that had traffic of packets during this period
-3. Identify client with most activity
-   1. Register server ips on these packets
-4. **Assume that this client represents the traffic of this window**
-   1. Bold assunption but proved valid by classifier + training data
-
-5. With the packet data create features and windowed features:
+3. For each client register the server ips
+4. With the packet data create features and windowed features:
    - Some the features are bellow look `feature_creation.py` for more details    
       - calculate average upload speed for specific client
       - calculate average download speed for specific client
@@ -28,7 +24,7 @@ Ignoring broadcast address (router) 192.168.0.1.
 
 ### Training and Classification
 
-For creating training data use a specific local machine, no mix of clients.
+For creating training data use a specific local machine, no mix of clients (single client).
 For classification use the ssh+tcpdump to OpenWrt router to br-lan interface and many clients can be classified at once at every 10 seconds.
 
 ### Lessons Learned
