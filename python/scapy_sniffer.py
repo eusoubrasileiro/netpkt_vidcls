@@ -1,14 +1,21 @@
 """
-For testing:
+### For testing:
 
-sudo tcpdump -i eno1 -s 1024 -w - port 80 or port 443 | python3 scapy_sniffer.py --verbose 
+```bash
+sudo tcpdump -i eno1 -s 192 -w - port 80 or port 443 | python3 scapy_sniffer.py --verbose 
+```
 
+### For debugging on vscode
 
-For debugging on vscode:
+#### Start tcpdump in background
+
+```bash
 sudo su 
 rm /tmp/packet_capture.pcap 
 mkfifo /tmp/packet_capture.pcap
 tcpdump -i eno1 -w /tmp/packet_capture.pcap 
+```
+
 """
 
 import argparse
