@@ -1,20 +1,19 @@
 ### Real-Time Network Packet Analysis for Video Streaming Identification
 
 The goal is to limit excessive video streaming and social media usage on my home network.  
-We could theoretically achieve this by analyzing network packet traffic (libpcap, tcpdump).  
+We could theoretically achieve this by analyzing network packet traffic.  
 Initially tought about using C and running directly on my OpenWrt router. 
-But for start it's easier to somehow redirect the traffic to a SBC (orangepi5 etc or another).
-There classify the source ip on our network and if it's a streaming traffic and for how long. 
-If streaming and for too long start blacklisting the external-destination ips on dnsmasq.
-Eventually reset every night those ips on dnsmasq.
-
+But for start it's easier to ssh to OpenWrt and tcpdump from a SBC (orangepi5 etc or another).
+There classify the source ip if on lan network and if it's a streaming traffic and for how long. 
+If streaming and for too long start blacklisting the external-destination ips on router's nftables.
+Eventually, reset every night those ips.
 
 #### Current Status
 
-So far we have the classification working by sampling network traffic every 10 seconds. 
-An ExtraTree model and some features create from header-packets (10 seconds of traffic data) are able to classify the trafic as video streaming or not.
+So far we have the classification working by sampling network traffic every 10 seconds by 10 seconds. 
+An ExtraTree model using features create from header-packets (10 seconds of traffic data) are able to classify the trafic as video streaming or not.
 Average 90% of binary average classification accuracy on random splitting scenarios with tranining data.
-Validated the 90% on some real scenarios 50% threshold using some good estimations.
+Validated the 90% on some real scenarios using some good estimations (50% threshold).
 
 Current working version was trained:
      - with 184.9MB of training data 
@@ -26,11 +25,25 @@ We can run it with bellow specifiying the interface `-i eno1` by its name
 sudo tcpdump -i eno1 -s 1024 -w - port 80 or port 443 | python3 scapy_sniffer.py --verbose 
 ```
 
-#### Real Time Plan
+##### Real Time Classification
 
-This can already work using 3 consecutive classes 1 classifications as a trigger. (for now 30 seconds)
+Use 3 consecutive classes 1 classifications as a trigger. (30 seconds window)
 For registering an ip in a state of watching a the video streaming. 
 And to remove it from the video streaming state another 3 classes 0. 
+
+#### Running from orangepi5
+
+
+```bash
+# adjust OPENWRT_IP, key, interface as needed
+OPENWRT_IP=192.168.0.1
+
+ssh -o ServerAliveInterval=30 root@$OPENWRT_IP \
+  "tcpdump -i br-lan -s 192 -nn -w  - 'port 80 or port 443'" \
+| python3 scapy_sniffer.py --verbose
+```
+
+
 
 ##### Future Ideas
 

@@ -67,6 +67,7 @@ def preprocess(df):
     # Filter out rows where both src_ip and dst_ip are in the subnet (ignore internal traffic)
     internal_traffic_mask = df['src_in_subnet'] & df['dst_in_subnet']
     df = df[~internal_traffic_mask]
+    # we might have empty df if no wan-lan traffic
 
     # Assign 'client' and 'server' based on whether src_ip or dst_ip is in the subnet
     df.loc[:, 'client'] = np.where(df['src_in_subnet'], df['src_ip'], df['dst_ip'])

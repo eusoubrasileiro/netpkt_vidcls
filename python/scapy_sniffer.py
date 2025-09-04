@@ -63,6 +63,12 @@ def get_pcap_reader(source):
     else:
         raise FileNotFoundError(f"Specified source '{source}' does not exist.")
 
+def most_active_client(data):
+    """Get the most active client from the data. Using 
+    the client with the highest average upload speed.
+    """
+    pass # TODO: implement this
+
 def main():
     parser = argparse.ArgumentParser(description="Network traffic sniffer and feature extractor.")
     parser.add_argument("--train", action="store_true", default=False, help="Record data for model training.")    
@@ -101,6 +107,7 @@ def main():
                 elapsed = (datetime.datetime.now() - start_time).total_seconds()
                 if elapsed >= 10:  # Process every 10 seconds                
                     if not args.train:
+                        client_ip = most_active_client(data)
                         X = make_windowed_features(preprocess(pd.DataFrame(data)))
                         X = X[config['selected_features']]                        
                         y = model.predict_proba(X)
