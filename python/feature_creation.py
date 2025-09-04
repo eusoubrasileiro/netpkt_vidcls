@@ -22,8 +22,8 @@ config['lan-subnet-mask'] = 24
 config['window-size'] = 10 
 
 config['path'] = {}
-config['path']['raw'] = '/home/andre/Projects/netpkt_vidcls/python/training/raw.h5'
-config['model'] = '/home/andre/Projects/netpkt_vidcls/python/etree.joblib'
+config['path']['raw'] = 'python/training/raw.h5' # relative path to project root
+config['model'] = 'python/etree.joblib'
 
 def update_hdf(df):
     dfdisk = pd.read_hdf(config['path']['raw'])

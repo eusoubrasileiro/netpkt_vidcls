@@ -1,12 +1,29 @@
-### Real-Time Network Packet Analysis for Video Streaming Identification
+### Real-Time Network Packet Analysis for Video Streaming Identification and Blocking
 
-The goal is to limit excessive video streaming and social media usage on my home network.  
-We could theoretically achieve this by analyzing network packet traffic.  
-Initially tought about using C and running directly on my OpenWrt router. 
-But for start it's easier to ssh to OpenWrt and tcpdump from a SBC (orangepi5 etc or another).
-There classify the source ip if on lan network and if it's a streaming traffic and for how long. 
-If streaming and for too long start blacklisting the external-destination ips on router's nftables.
-Eventually, reset every night those ips.
+This project identifies clients on a local network that are watching video streaming. 
+After a configurable daily time quota (default 30 min), blocks the destination servers they are connected to. 
+This is achieved by analyzing network traffic in real-time and dynamically updating `nftables` blacklisting servers ips.
+For those it relies on a OpenWrt router with `tcpdump` and `nftables` + a SBC (orangepi5 etc or another) with python support.
+
+
+#### How It Works
+
+1.  **Packet Capture:** `tcpdump` captures network traffic from a specified interface (e.g., your LAN interface).
+2.  **Real-Time Analysis:** The captured traffic is piped to `scapy_sniffer.py`. This script analyzes the packets in 10-second windows.
+3.  **Per-Client Classification:** For each client on the local network, the script uses a pre-trained Extra Trees machine learning model (`etree.joblib`) to classify their traffic as "video streaming" or "not video streaming".
+4.  **Time Tracking:** The `blocker.py` module tracks the cumulative streaming time for each client over a 24-hour period.
+5.  **Automated Blocking:** If a client's total streaming time exceeds the configured limit (e.g., 30 min.), the `blocker` module identifies the server IPs they are streaming from and adds them to a `nftables` blocklist file (e.g. `/etc/blocked-ips-v4.txt`) configured by a nft file using `uci firewall` openwrt.
+6.  **DNS Blackholing:** `dnsmasq` is automatically signaled to reload its configuration, effectively blocking the client's access to the streaming service by redirecting its DNS queries to `0.0.0.0`.
+7.  **State Persistence:** The streaming duration for each client is saved in `streaming_state.json`, so the script can be restarted without losing track of usage.
+
+---
+
+#### Setup and Configuration
+
+1.  **Dependencies:** Ensure you have Python 3, `tcpdump`, and `dnsmasq` installed. You will also need the required Python libraries:
+    ```bash
+    pip install pandas scapy joblib numpy
+    ```
 
 #### Current Status
 
