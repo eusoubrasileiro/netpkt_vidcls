@@ -107,3 +107,108 @@ We can reach even 99% of avg. precision... how much I care for recall?
 
 ~~- Try incorporate DNS query logs for more accurate source classification.~~
 
+
+
+### GPT5 ANSWER
+
+Short answer: yes—buffering and ABR (adaptive bitrate) make traffic **bursty** (2–6 s segment downloads, then silence). If you naïvely count “active time” only when bps > threshold, you’ll under-count during the silent gaps, and if you only count bytes you can over-count big prefetches. Fix it with a small state machine + smoothing.
+
+Here’s a battle-tested approach that works well in home networks:
+
+## How to make it robust (no flapping)
+
+1. **Watch UDP/443 too.** Most video is QUIC.
+2. **Sliding window + EWMA.** Compute bytes/sec every `W=2–5s`, but smooth with an EWMA so spikes don’t flip states.
+3. **Hysteresis thresholds.**
+
+   * Enter PLAYING if `rate_ewma ≥ START_T` for **K** consecutive windows (e.g., K=2).
+   * Stay PLAYING until `rate_ewma < STOP_T` for **M** consecutive windows (e.g., M=6).
+   * Use `STOP_T` < `START_T` (e.g., 150 kbps vs 400 kbps).
+4. **Buffer-credit accounting.** When in PLAYING and you see a big burst, add
+
+   ```
+   buffer_credit_seconds += bytes_in_window / est_bitrate
+   ```
+
+   Clamp `buffer_credit_seconds` to, say, **90 s** per (client, provider). During quiet gaps, **decrement** credit and **keep counting time** as PLAYING until it hits zero. This matches how players fetch a few segments, then coast.
+
+   * Keep a rolling `est_bitrate` per (client, provider) = EWMA of observed rate while in PLAYING.
+5. **Minimum session length.** Ignore “sessions” that last <10 s to avoid counting previews/autoplay thumbnails.
+6. **Cooldown before blocking.** When quota is hit, add `(client . server)` to your nftables set with a short **grace (e.g., 30 s)** first or show a message; then extend to your full block timeout. This prevents instant oscillation if the app retries on a different CDN IP.
+7. **Aggregate by provider, not single IP.** Track state per `(client, provider)` (YouTube/Netflix/etc.). Multiple CDN IPs rotate under one session; your ip-pair blocklist is only for enforcement.
+
+## Tiny drop-in logic (adapt to your script)
+
+```python
+# --- tuning ---
+WINDOW = 3.0                        # seconds
+START_T = 400_000                   # ~400 kbps start
+STOP_T  = 150_000                   # ~150 kbps stop
+K_CONSEC_START = 2
+M_CONSEC_STOP  = 6
+MAX_BUFFER_SEC = 90
+ALPHA = 0.3                         # EWMA weight
+
+# per (client, provider) state
+state = {}  # key -> dict(play=False, ewma=0, est_bitrate=800_000, k=0, m=0, buf=0, used=0)
+
+def tick(client_ip, provider, bytes_in_window):
+    key = (client_ip, provider)
+    s = state.setdefault(key, dict(play=False, ewma=0, est_bitrate=800_000,
+                                   k=0, m=0, buf=0.0, used=0))
+    rate = bytes_in_window / WINDOW  # bytes/sec
+    s['ewma'] = (1-ALPHA)*s['ewma'] + ALPHA*rate
+
+    # update est_bitrate only when playing (stabilizes to what this device really uses)
+    if s['play']:
+        s['est_bitrate'] = 0.8*s['est_bitrate'] + 0.2*max(s['ewma'], 100_000)
+
+    # accumulate buffer on bursts while playing (or when just starting)
+    if s['ewma'] >= START_T:
+        s['buf'] = min(MAX_BUFFER_SEC, s['buf'] + bytes_in_window / max(s['est_bitrate'], 1))
+
+    if not s['play']:
+        s['k'] = s['k'] + 1 if s['ewma'] >= START_T else 0
+        if s['k'] >= K_CONSEC_START:
+            s['play'] = True
+            s['k'] = 0
+            # seed a little buffer at start
+            s['buf'] = min(MAX_BUFFER_SEC, s['buf'] + 5)
+    else:
+        if s['ewma'] < STOP_T:
+            s['m'] += 1
+        else:
+            s['m'] = 0
+        # consume buffer during quiet gaps; count time as playing while buf > 0
+        playing_this_window = True
+        if s['ewma'] < STOP_T:
+            s['buf'] = max(0.0, s['buf'] - WINDOW)
+            if s['buf'] <= 0 and s['m'] >= M_CONSEC_STOP:
+                s['play'] = False
+                playing_this_window = False
+                s['m'] = 0
+
+        if playing_this_window:
+            s['used'] += WINDOW  # this is your “watch-time” to compare vs quota
+
+    return s['play'], s['used']       # you can act on quota elsewhere
+```
+
+* Feed `tick()` once per WINDOW with the **summed bytes** you measured for that `(client, provider)` in the last window.
+* When `used ≥ quota_seconds[client][provider]`, push the `(client . server_ip)` into your nftables set (as you already do).
+* Keep a short **hold timer** (e.g., 20–30 s) before inserting the block to avoid punishing momentary spikes.
+
+## Why this handles buffering well
+
+* **Segment cadence** is absorbed by `MAX_BUFFER_SEC` and the EWMA/hysteresis. You won’t flip to IDLE during the silent gaps between segments; you keep counting down the buffer.
+* **Prefetch spikes** don’t gift hours of watch-time: the credit is capped, and later idle windows “spend” the credit at real-time speed.
+* **Quality changes (ABR)** auto-adjust via `est_bitrate`—your bytes→seconds conversion tracks what the device is actually pulling.
+
+## Practical defaults to start
+
+* `WINDOW=3s`, `START_T=400 kbps`, `STOP_T=150 kbps`, `MAX_BUFFER_SEC=90s`
+* Start with per-device daily quotas like 30–60 min for “Video” bucket (sum of YouTube + Netflix + Reels/TikTok).
+* Log decisions for a day before enforcing; check a few manual sessions to calibrate thresholds.
+
+If you want, I can splice this into the earlier skeleton (with SNI/DNS → provider mapping, nftables insert) so you can run it right away on the Orange Pi 5.
+
