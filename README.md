@@ -1,3 +1,53 @@
+# netpkt\_vidcls — *naive* branch (very short README)
+
+**Goal.** A simple, real-time “video time guard” for a home LAN. Instead of ML, the `naive` branch counts **smoothed throughput** per client and, when a daily quota is exceeded, blocks only the hot `(client_ip, server_ip)` pairs.
+The existing `python/scapy_sniffer.py` on `main` stays as the baseline Scapy sniffer. ([scapy.readthedocs.io][1])
+
+## How it works (naive)
+
+* Sniff headers/lengths (TCP/UDP 443 and 80), compute EWMA kbps per client, apply hysteresis to avoid flapping, and accumulate “watch-time” while above threshold.
+* On quota hit, insert `(client . server)` into an **nftables concatenated set** with a timeout (cool-off). ([wiki.nftables.org][2], [netfilter.org][3])
+* Optional: use SNI from TLS/QUIC (`tls.handshake.extensions_server_name`) or DNS logs for labeling, but not required for enforcement. ([Gist][4])
+
+## Router rule (OpenWrt fw4)
+
+Create a drop-in like `/etc/nftables.d/30-streamctl.nft`:
+
+```nft
+table inet fw4 {
+  set stream_user_block {
+    type ipv4_addr . ipv4_addr
+    flags timeout
+    timeout 24h
+  }
+  chain stream_quota {
+    type filter hook forward priority 0; policy accept;
+    ip saddr . ip daddr @stream_user_block drop
+  }
+}
+```
+
+`fw4` automatically includes `*.nft` from `/etc/nftables.d/` into the `inet/fw4` table. ([OpenWrt][5])
+
+## Quick start (when you return)
+
+1. **Branch:** `git switch naive`
+2. **Run watcher:** script reads bytes/sec windows, tracks per-client usage, and calls `nft add element inet fw4 stream_user_block '{ <client> . <server> timeout 2h }'` on quota. (Named sets allow O(1) updates.) ([netfilter.org][3])
+3. **(Optional) SNI/DNS helper:** if needed, you can extract SNI via tshark fields (e.g., `-e tls.handshake.extensions_server_name`). ([Gist][4])
+
+**Notes.** Keep thresholds modest (e.g., start ≈ 400 kbps, stop ≈ 150 kbps, 3s window). This catches bursty video segments without an ML classifier.
+
+[1]: https://scapy.readthedocs.io/en/latest/usage.html?utm_source=chatgpt.com "Usage — Scapy 2.6.1 documentation"
+[2]: https://wiki.nftables.org/wiki-nftables/index.php/Concatenations?utm_source=chatgpt.com "Concatenations - nftables wiki"
+[3]: https://www.netfilter.org/projects/nftables/manpage.html?utm_source=chatgpt.com "Man page of NFT"
+[4]: https://gist.github.com/gregjhogan/3a5cf79bebd78c1a0ca6566400dd357e?utm_source=chatgpt.com "wireshark tls sni and http filter"
+[5]: https://openwrt.org/docs/guide-user/firewall/firewall_configuration?utm_source=chatgpt.com "[OpenWrt Wiki] Firewall configuration /etc/config ..."
+
+
+
+
+
+
 ### Real-Time Network Packet Analysis for Video Streaming Identification and Blocking
 
 This project ~~identifies clients on a local network that are watching video streaming~~. (**!!Only identifies some bursts**)

@@ -157,7 +157,7 @@ def main():
                                         f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
                                         f"Client: {client_ip:<15} | Status: {client_status:<7} | "
                                         f"Activity: {status_msg:<15} | "
-                                        f"Score/Threshold: {score:3.0f}%/{config['class-1-threshold']*100:3.0f}%"
+                                        f"Score/Score Threshold: {score:3.0f}%/{config['class-1-threshold']*100:3.0f}%"
                                     )
                         
                         data.clear()  # Clear data after processing
