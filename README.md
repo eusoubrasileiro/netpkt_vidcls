@@ -1,9 +1,9 @@
 ### Real-Time Network Packet Analysis for Video Streaming Identification and Blocking
 
-This project identifies clients on a local network that are watching video streaming. 
-After a configurable daily time quota (default 30 min), blocks the destination servers they are connected to. 
-This is achieved by analyzing network traffic in real-time and dynamically updating `nftables` blacklisting servers ips.
-For those it relies on a OpenWrt router with `tcpdump` and `nftables` + a SBC (orangepi5 etc or another) with python support.
+This project ~~identifies clients on a local network that are watching video streaming~~. (**!!Only identifies some bursts**)
+After a configurable daily time quota (default 30 min), blocks the destination servers they are connected to. (**Not done yet**)
+This is achieved by analyzing network traffic in real-time and dynamically updating `nftables` blacklisting servers ips. (**Not done yet**)
+For those it relies on a OpenWrt router with `tcpdump` and `nftables` + a SBC (orangepi5 etc or another) with python support. (**Not done yet**)
 
 
 #### How It Works
