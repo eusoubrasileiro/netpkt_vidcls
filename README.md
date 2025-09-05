@@ -30,7 +30,6 @@ For those it relies on a OpenWrt router with `tcpdump` and `nftables` + a SBC (o
 So far we have the classification working by sampling network traffic every 10 seconds by 10 seconds. 
 An ExtraTree model using features create from header-packets (10 seconds of traffic data) are able to classify the trafic as video streaming or not.
 Average 90% of binary average classification accuracy on random splitting scenarios with tranining data.
-Validated the 90% on some real scenarios using some good estimations (50% threshold).
 
 Current working version was trained:
      - with 184.9MB of training data 
@@ -49,6 +48,30 @@ Also use class 1 threshold of 70% to classify as real streaming.
 For registering an ip in a state of watching a the video streaming. 
 And to remove it from the video streaming state another 3 classes 0. 
 
+### **But that's isn't enough for real time classification
+
+> Buffering and ABR (adaptive bitrate) make traffic bursty (2–6 s segment downloads, then silence). 
+If you naïvely count “active time” only when bps > threshold, you’ll under-count during the silent gaps,
+
+GPT5 suggested:
+
+> 1. **Sliding window + EWMA.** Compute bytes/sec every `W=2–5s`, but smooth with an EWMA so spikes don’t flip states.
+> 2. **Hysteresis thresholds.**
+>   * Enter PLAYING if `rate_ewma ≥ START_T` for **K** consecutive windows (e.g., K=2).
+>   * Stay PLAYING until `rate_ewma < STOP_T` for **M** consecutive windows (e.g., M=6).
+>   * Use `STOP_T` < `START_T` (e.g., 150 kbps vs 400 kbps).
+> 3. **Buffer-credit accounting.** When in PLAYING and you see a big burst, add
+>   ```
+>   buffer_credit_seconds += bytes_in_window / est_bitrate
+>   ```
+>   Clamp `buffer_credit_seconds` to, say, **90 s** per (client, provider). During quiet gaps, **decrement** credit and **keep counting time** as PLAYING until it hits zero. This matches how players fetch a few segments, then coast.
+>
+>   * Keep a rolling `est_bitrate` per (client, provider) = EWMA of observed rate while in PLAYING.
+> 4. **Minimum session length.** Ignore “sessions” that last <10 s to avoid counting previews/autoplay thumbnails.
+> 5. **Cooldown before blocking.** When quota is hit, add `(client . server)` to your nftables set with a short **grace (e.g., 30 s)** first or show a message; then extend to your full block timeout. This prevents instant oscillation if the app  retries on a different CDN IP.
+> 6. **Aggregate by provider, not single IP.** Track state per `(client, provider)` (YouTube/Netflix/etc.). Multiple CDN IPs rotate under one session; your ip-pair blocklist is only for enforcement.
+
+
 #### Running from orangepi5
 
 
@@ -62,6 +85,10 @@ ssh -o ServerAliveInterval=30 root@$OPENWRT_IP \
 ```
 
 #### TODO
+
+Rethink approach... like sessions or use `tshark` (open source wire-shark)
+Maybe analyze pair of ip's and training is completly wrong. 
+Should make another aproach for feature creation and training.
 
 1. Create blocker.py to manage a local JSON file with client states. 
 If 3 consecutive flags for one client put it on streaming state and start to count its time.
