@@ -37,13 +37,32 @@ Modern video streaming uses adaptive bitrate (ABR) with segment-based delivery:
 ### Implementation Status
 
 - **ML approach (main branch):** Fully implemented but fundamentally flawed
-- **Naive approach (naive branch):** Pseudocode in README (lines 192-264), NOT YET IMPLEMENTED
+- **Naive approach (naive branch):** Phase 1 (logging only) IMPLEMENTED
 
-**See `IMPLEMENTATION_PLAN.md` for detailed naive implementation plan.**
+**See `IMPLEMENTATION_PLAN.md` for detailed implementation plan.**
 
 ## Common Commands
 
-### Running the sniffer
+### Running the Naive Sniffer (RECOMMENDED)
+
+**Direct to router (home network monitoring):**
+```bash
+ssh root@192.168.0.1 "tcpdump -i br-lan -s 192 -nn -w - 'port 80 or port 443'" \
+  | python3 naive_sniffer.py --log-only
+```
+
+**With verbose output:**
+```bash
+ssh root@192.168.0.1 "tcpdump -i br-lan -s 192 -nn -w - 'port 80 or port 443'" \
+  | python3 naive_sniffer.py --log-only --verbose
+```
+
+**Local interface testing:**
+```bash
+sudo tcpdump -i eno1 -s 192 -w - port 80 or port 443 | python3 naive_sniffer.py --log-only --verbose
+```
+
+### Running the ML Sniffer (DEPRECATED)
 
 **Local interface:**
 ```bash
@@ -144,14 +163,42 @@ nft add element inet fw4 stream_user_block '{ <client_ip> . <server_ip> timeout 
 - **10-second window**: Smaller windows decrease accuracy
 - **Real-time classification**: Uses 3 consecutive class-1 predictions (30s total) with 70% probability threshold to register streaming state
 
-### Naive Approach (Current Branch)
+### Naive Approach (Current Branch) - IMPLEMENTED
 
-Instead of ML, uses smoothed throughput tracking:
-- **EWMA** smoothing of bytes/sec (e.g., 3s windows, alpha=0.3)
-- **Hysteresis thresholds**: START_T=400kbps, STOP_T=150kbps with consecutive window requirements (K=2 to start, M=6 to stop)
-- **Buffer-credit accounting**: Tracks buffered content in seconds (max 90s), counts watch time during quiet gaps until buffer depleted
-- Handles adaptive bitrate (ABR) and segment-based downloads (2-6s bursts followed by silence)
-- See README lines 192-264 for reference implementation
+Simple throughput-based detection without ML:
+
+**Files:**
+- `python/naive_config.py` - Configuration parameters
+- `python/naive_tracker.py` - Core detection logic (~250 lines)
+- `python/naive_sniffer.py` - tcpdump integration
+
+**Current Configuration (Phase 1):**
+```python
+'window_size': 5,           # seconds per window
+'rate_threshold': 50_000,   # bytes/sec (400 kbps) - tuned from training data
+'consecutive_windows': 3,   # 15s sustained to trigger streaming
+'daily_quota_seconds': 3600 # 1 hour default
+```
+
+**Detection Algorithm:**
+1. Accumulate bytes per (client, server) flow in 5-second windows
+2. Calculate rate = bytes_in_window / window_size
+3. If rate > 50KB/s for 3 consecutive windows (15s) → STREAMING_START
+4. If rate drops below threshold → STREAMING_STOP
+5. Accumulate watch time while streaming
+
+**Output Logs:**
+- `STREAMING_START` / `STREAMING_STOP` - Per-flow state changes
+- `WATCH_START` / `WATCH_STOP` - Per-client session tracking
+- `CLIENT` - Per-window summary with watch time and quota %
+
+**State Persistence:**
+- `naive_state.json` - Survives restarts, tracks quota usage
+- Daily quota resets at midnight
+
+**Future Phases (not yet implemented):**
+- Phase 2: nftables enforcement when quota exceeded
+- Phase 3: EWMA smoothing, buffer-credit accounting, hysteresis thresholds
 
 ## Configuration
 
