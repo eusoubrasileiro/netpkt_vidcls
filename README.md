@@ -1,78 +1,117 @@
-# netpkt_vidcls
+# StreamGuard
 
-Real-time video streaming detection and quota enforcement for home LANs.
-
-## What It Does
-
-- Detects video streaming (YouTube, Netflix, etc.) per client
-- Tracks watch time with configurable daily quotas
-- Blocks streaming servers via nftables when quota exceeded
+Enforce daily video streaming quotas on your home network. When kids hit their YouTube/Netflix/TikTok limit, streaming is blocked until the next day.
 
 ## How It Works
 
-Sniffs TCP/UDP traffic (ports 80, 443) and tracks throughput per `(client, server)` pair. When sustained high throughput is detected (>300kbps for 15s), it's classified as streaming and watch time accumulates.
+StreamGuard runs on a Linux machine (Ubuntu, Orange Pi, etc.) and monitors network traffic using **nDPI** to identify streaming protocols. When a client exceeds their daily quota, their IP is blocked from streaming destinations via your OpenWrt router's firewall.
 
-On quota exceeded, blocks the `(client_ip, server_ip)` pair using an nftables concatenated set with automatic timeout expiry.
+```
+Kids' Devices ──► OpenWrt Router ──► Internet
+                       │
+                       ▼
+                 StreamGuard (Ubuntu)
+                 - Detects YouTube, Netflix, TikTok...
+                 - Tracks watch time per device
+                 - Blocks when quota exceeded
+```
 
 ## Quick Start
 
-### 1. Router Setup (OpenWrt)
+### Prerequisites
 
-Create `/etc/nftables.d/30-streamctl.nft`:
-
-```nft
-table inet fw4 {
-  set stream_user_block {
-    type ipv4_addr . ipv4_addr
-    flags timeout
-    timeout 24h
-  }
-  chain stream_quota {
-    type filter hook forward priority 0; policy accept;
-    ip saddr . ip daddr @stream_user_block drop
-  }
-}
+**Ubuntu machine:**
+```bash
+sudo apt install libndpi-dev libpcap-dev libcjson-dev build-essential
 ```
 
-Reload: `fw4 reload`
+**OpenWrt router:**
+- Root SSH access
+- tcpdump: `opkg install tcpdump`
 
-### 2. Run the Detector
+### 1. Build
 
 ```bash
-# From monitoring host (Orange Pi 5, etc.)
-OPENWRT_IP=192.168.0.1
-ssh root@$OPENWRT_IP "tcpdump -i br-lan -s 192 -nn -w - 'port 80 or port 443'" \
-  | python3 python/naive_sniffer.py --log-only --verbose
+git clone https://github.com/yourusername/streamguard.git
+cd streamguard/src
+make
 ```
 
-Use `--enforce` instead of `--log-only` to enable blocking.
+### 2. Setup SSH Key Auth to Router
 
-## Configuration
-
-Edit `python/naive_config.py`:
-
-```python
-'rate_threshold': 300_000,      # bytes/sec to detect streaming
-'consecutive_windows': 3,       # windows (5s each) to confirm
-'daily_quota_seconds': 3600,    # 1 hour default
+```bash
+ssh-copy-id root@192.168.0.1
+ssh root@192.168.0.1 "echo OK"  # Should work without password
 ```
 
-## Requirements
+### 3. Configure Router
 
-- Python 3 + `pandas`, `scapy`
-- OpenWrt router with `tcpdump` + `nftables`
+```bash
+cd scripts/openwrt
+./install.sh 192.168.0.1
+```
 
-## Status
+### 4. Test (Dry-Run Mode)
 
-| Branch | Approach | Status |
-|--------|----------|--------|
-| `naive` | Throughput-based | Active (recommended) |
-| `main` | ML classification | Deprecated |
+```bash
+sudo ./streamguard -i eno1  # Replace eno1 with your interface
+```
 
-The ML approach has a [buffering accuracy problem](docs/BUFFERING_PROBLEM.md) that makes it unsuitable for quota enforcement.
+Watch YouTube on a device - you should see detection logs.
+
+### 5. Enable Enforcement
+
+```bash
+sudo ./streamguard -i eno1 -e -q 3600  # 1 hour quota
+```
+
+## Usage
+
+```
+streamguard -i <interface> [options]
+
+Options:
+  -i <iface>   Network interface (required)
+  -q <secs>    Daily quota in seconds (default: 3600 = 1 hour)
+  -e           Enable enforcement (blocks when quota exceeded)
+  -f <file>    State file path
+  -h           Help
+```
+
+## Detected Services
+
+YouTube, Netflix, TikTok, Twitch, Disney+, Amazon Video, Hulu, Instagram, Facebook
+
+## Run as Service
+
+```bash
+sudo cp scripts/streamguard.service /etc/systemd/system/
+# Edit the service file to set your interface and quota
+sudo systemctl daemon-reload
+sudo systemctl enable --now streamguard
+```
+
+## Monitoring
+
+```bash
+# Check service status
+sudo systemctl status streamguard
+
+# View logs
+sudo journalctl -u streamguard -f
+
+# Check blocked clients on router
+ssh root@192.168.0.1 'nft list set inet fw4 blocked_streaming_clients'
+
+# Manually unblock someone
+ssh root@192.168.0.1 "nft delete element inet fw4 blocked_streaming_clients '{ 192.168.0.10 }'"
+```
 
 ## Documentation
 
-- [Why Naive > ML](docs/BUFFERING_PROBLEM.md) - The buffering problem explained
-- [Implementation Plan](docs/IMPLEMENTATION_PLAN.md) - Detailed implementation phases
-- [ML Approach](docs/ML_APPROACH.md) - Deprecated ML documentation
+- [DEPLOYMENT.md](DEPLOYMENT.md) - Detailed setup guide
+- [CLAUDE.md](CLAUDE.md) - Developer reference
+
+## License
+
+MIT

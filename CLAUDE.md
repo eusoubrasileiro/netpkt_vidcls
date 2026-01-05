@@ -1,253 +1,160 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Developer reference for Claude Code when working with this repository.
 
 ## Project Overview
 
-Real-time network packet analysis to identify video streaming traffic and enforce daily time quotas. When a client exceeds their quota, the system blocks specific `(client_ip, server_ip)` pairs using nftables on an OpenWrt router.
+**StreamGuard** - Real-time video streaming detection and daily quota enforcement for home networks.
 
-**Two approaches:**
-- **naive branch** (RECOMMENDED): Throughput-based tracking using EWMA, hysteresis, and buffer-credit accounting
-- **main branch** (DEPRECATED): ML-based classification using ExtraTree model with packet header features
-
-## ⚠️ CRITICAL: Which Approach to Use?
-
-**USE THE NAIVE APPROACH.** The ML approach has a fundamental flaw that makes it unsuitable for quota enforcement.
-
-### The Buffering Problem (Why ML Fails)
-
-Modern video streaming uses adaptive bitrate (ABR) with segment-based delivery:
-- **Burst phase** (2-3s): Downloads 6s of video at high speed
-- **Silent phase** (3-4s): Player buffers, no network traffic
-- **ML counts only burst time** → 30min video = ~10min detected ❌
-- **Naive counts correctly** → Tracks buffer credit during silence ✅
-
-### Quick Comparison
-
-| Criterion | ML Approach | Naive Approach |
-|-----------|-------------|----------------|
-| **Time accuracy** | ❌ 30-40% of actual | ✅ ~95% accurate |
-| **Code complexity** | ❌ 500+ lines | ✅ ~60 lines |
-| **Maintenance** | ❌ Retrain model | ✅ Adjust thresholds |
-| **False positives** | ✅ ~7% | ⚠️ ~20% (acceptable) |
-| **Detection delay** | ⚠️ 30s | ✅ 9-15s |
-
-**Verdict:** Naive approach is significantly better for this use case.
-
-### Implementation Status
-
-- **ML approach (main branch):** Fully implemented but fundamentally flawed
-- **Naive approach (naive branch):** Phase 1 (logging only) IMPLEMENTED
-
-**See `IMPLEMENTATION_PLAN.md` for detailed implementation plan.**
-
-## Common Commands
-
-### Running the Naive Sniffer (RECOMMENDED)
-
-**Direct to router (home network monitoring):**
-```bash
-ssh root@192.168.0.1 "tcpdump -i br-lan -s 192 -nn -w - 'port 80 or port 443'" \
-  | python3 naive_sniffer.py --log-only
-```
-
-**With verbose output:**
-```bash
-ssh root@192.168.0.1 "tcpdump -i br-lan -s 192 -nn -w - 'port 80 or port 443'" \
-  | python3 naive_sniffer.py --log-only --verbose
-```
-
-**Local interface testing:**
-```bash
-sudo tcpdump -i eno1 -s 192 -w - port 80 or port 443 | python3 naive_sniffer.py --log-only --verbose
-```
-
-### Running the ML Sniffer (DEPRECATED)
-
-**Local interface:**
-```bash
-sudo tcpdump -i eno1 -s 1024 -w - port 80 or port 443 | python3 scapy_sniffer.py --verbose
-```
-
-**From Orange Pi 5 to OpenWrt router:**
-```bash
-OPENWRT_IP=192.168.0.1
-ssh -o ServerAliveInterval=30 root@$OPENWRT_IP \
-  "tcpdump -i br-lan -s 192 -nn -w - 'port 80 or port 443'" \
-| python3 scapy_sniffer.py --verbose
-```
-
-### Training data collection
-
-```bash
-sudo tcpdump -i <interface> -s 1024 -w - port 80 or port 443 | python3 scapy_sniffer.py --train
-```
-
-Training data should be collected from single clients, manually classified scenarios (see `python/training/Readme.md` for list of existing training data).
+Uses **nDPI** (Deep Packet Inspection) to identify streaming protocols (YouTube, Netflix, TikTok, etc.) and blocks clients via **nftables** when they exceed their daily quota.
 
 ## Architecture
 
-### Data Flow
-
-1. **tcpdump** captures packets (TCP/UDP ports 80, 443) from network interface
-2. **scapy_sniffer.py** processes packets in 10-second windows:
-   - Parses packet headers (IP, TCP, UDP fields)
-   - Identifies clients (LAN IPs) and servers (WAN IPs) via subnet filtering
-   - Creates statistical features from packet data
-3. **ML path** (main branch): ExtraTree model classifies traffic as streaming/non-streaming
-4. **Naive path** (naive branch): Tracks smoothed throughput with state machine (PLAYING/IDLE)
-5. **blocker.py** manages client state, tracks usage time, enforces quotas
-6. **nftables** on OpenWrt router blocks specific IP pairs when quota exceeded
-
-### Key Components
-
-**python/scapy_sniffer.py**
-- Main entry point for packet processing
-- Reads from stdin (piped from tcpdump) or named pipe
-- Processes packets in 10-second windows
-- `--train` flag for data collection, `--verbose` for detailed output
-- Handles both training and inference modes
-
-**python/feature_creation.py**
-- `preprocess()`: Filters LAN↔WAN traffic, assigns client/server roles, converts categorical fields
-- `make_windowed_features()`: Extracts 25+ statistical features per client per 10s window:
-  - Upload/download speeds, packet size statistics (mean, variance, entropy)
-  - TCP/UDP port diversity, unique IPs (connection multiplexing)
-  - Packet timing (delay average, jitter, entropy)
-  - TTL statistics (important for identifying CDN patterns)
-- Selected features for model: `ack_entropy`, `ttl_entropy`, `tcp_ack_var`, `udp_nports`, `pkt_entropy`, `dw_pkt_avg`, `dw_ttl_avg`, `dw_ttl_unique`, `dw_pkt_entropy`, `dl_pkt_avg`
-
-**python/blocker.py**
-- Tracks streaming state with hysteresis (3 consecutive classifications to change state)
-- Accumulates watch time per client
-- When quota exceeded, progressively blocks server IPs (highest traffic first)
-- Persists state to `clients.json`, writes blocked IPs to `/etc/blocked-ips-v4.txt`
-- Currently commented out in scapy_sniffer.py (TODO: integrate)
-
-**python/config.py**
-- Central configuration: LAN subnet, window size (10s), class-1 threshold (0.6), streaming limit (3600s default)
-- Selected features list for model
-- Paths to training data (`training/raw.h5`) and model (`etree.joblib`)
-
-**libpcap/packets.c**
-- Older C implementation using libpcap (not actively used)
-- Demonstrates basic packet capture and PPS calculation
-
-### nftables Integration (OpenWrt)
-
-Router configuration for blocking (see README for full example):
-```nft
-table inet fw4 {
-  set stream_user_block {
-    type ipv4_addr . ipv4_addr  # Concatenated set for (client . server) pairs
-    flags timeout
-    timeout 24h
-  }
-  chain stream_quota {
-    type filter hook forward priority 0; policy accept;
-    ip saddr . ip daddr @stream_user_block drop
-  }
-}
+```
+Ubuntu Machine (StreamGuard)              OpenWrt Router
+┌─────────────────────────────┐           ┌──────────────────────────────┐
+│  streamguard                │           │  dnsmasq                     │
+│  - libpcap capture          │    SSH    │  - populates streaming IPs   │
+│  - nDPI protocol detection  │ ────────► │                              │
+│  - quota tracking           │   nft     │  nftables                    │
+│  - state persistence        │  commands │  - blocked_streaming_clients │
+└─────────────────────────────┘           │  - streaming_destinations    │
+         ▲                                │  - DROP rule                 │
+         │ packets                        └──────────────────────────────┘
+         │
+    Network (eno1)
 ```
 
-Python adds blocked pairs via:
+**How it works:**
+1. StreamGuard captures packets on Ubuntu machine
+2. nDPI identifies streaming protocols (YouTube, Netflix, etc.)
+3. Per-client watch time accumulated, saved to JSON
+4. When quota exceeded, client IP added to router's nftables blocked set
+5. Router drops traffic from blocked clients to streaming destinations
+6. Quotas reset daily at midnight
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `src/streamguard.c` | Main C implementation (~700 lines) |
+| `src/Makefile` | Build system |
+| `scripts/openwrt/setup-nftables.sh` | Router firewall setup |
+| `scripts/openwrt/dnsmasq-streaming.conf` | Streaming domain list |
+| `scripts/openwrt/install.sh` | Deploy config to router |
+| `scripts/streamguard.service` | Systemd service file |
+
+## Common Commands
+
+### Build
 ```bash
-nft add element inet fw4 stream_user_block '{ <client_ip> . <server_ip> timeout 2h }'
+cd src
+make
 ```
 
-### ML Model Details
-
-- **Algorithm**: ExtraTree (Extra Trees Classifier) with default parameters
-- **Training**: ~185MB data, 8 manually classified scenarios (YouTube, Instagram, normal browsing, locked screen)
-- **Performance**: ~90-93% binary classification accuracy
-- **10-second window**: Smaller windows decrease accuracy
-- **Real-time classification**: Uses 3 consecutive class-1 predictions (30s total) with 70% probability threshold to register streaming state
-
-### Naive Approach (Current Branch) - IMPLEMENTED
-
-Simple throughput-based detection without ML:
-
-**Files:**
-- `python/naive_config.py` - Configuration parameters
-- `python/naive_tracker.py` - Core detection logic (~250 lines)
-- `python/naive_sniffer.py` - tcpdump integration
-
-**Current Configuration (Phase 1):**
-```python
-'window_size': 5,           # seconds per window
-'rate_threshold': 50_000,   # bytes/sec (400 kbps) - tuned from training data
-'consecutive_windows': 3,   # 15s sustained to trigger streaming
-'daily_quota_seconds': 3600 # 1 hour default
+### Run (dry-run mode - logs only)
+```bash
+sudo ./streamguard -i eno1
 ```
 
-**Detection Algorithm:**
-1. Accumulate bytes per (client, server) flow in 5-second windows
-2. Calculate rate = bytes_in_window / window_size
-3. If rate > 50KB/s for 3 consecutive windows (15s) → STREAMING_START
-4. If rate drops below threshold → STREAMING_STOP
-5. Accumulate watch time while streaming
+### Run (enforcement mode - blocks when quota exceeded)
+```bash
+sudo ./streamguard -i eno1 -e -q 3600
+```
 
-**Output Logs:**
-- `STREAMING_START` / `STREAMING_STOP` - Per-flow state changes
-- `WATCH_START` / `WATCH_STOP` - Per-client session tracking
-- `CLIENT` - Per-window summary with watch time and quota %
+### Deploy router config
+```bash
+cd scripts/openwrt
+./install.sh 192.168.0.1
+```
 
-**State Persistence:**
-- `naive_state.json` - Survives restarts, tracks quota usage
-- Daily quota resets at midnight
+### Check blocked clients on router
+```bash
+ssh root@192.168.0.1 'nft list set inet fw4 blocked_streaming_clients'
+```
 
-**Future Phases (not yet implemented):**
-- Phase 2: nftables enforcement when quota exceeded
-- Phase 3: EWMA smoothing, buffer-credit accounting, hysteresis thresholds
+### Manually unblock a client
+```bash
+ssh root@192.168.0.1 "nft delete element inet fw4 blocked_streaming_clients '{ 192.168.0.10 }'"
+```
+
+## CLI Options
+
+```
+Usage: streamguard -i <interface> [options]
+
+Required:
+  -i <iface>   Network interface (e.g., eno1, eth0)
+
+Options:
+  -s <subnet>  LAN subnet (default: 192.168.0.0)
+  -m <mask>    LAN netmask (default: 255.255.255.0)
+  -q <secs>    Daily quota in seconds (default: 3600)
+  -f <file>    State file path (default: streamguard_state.json)
+  -e           Enable enforcement mode (blocks via nftables)
+  -h           Show help
+
+Without -e, runs in dry-run mode (logs only, no blocking).
+```
+
+## Detected Protocols
+
+StreamGuard detects these streaming services via nDPI:
+
+**Video Streaming:**
+- YouTube, Netflix, TikTok, Twitch
+- Disney+, Amazon Video, Hulu
+- Instagram, Facebook video
+
+**Not Tracked (by design):**
+- Spotify, Apple Music (audio only)
 
 ## Configuration
 
-Edit `python/config.py`:
-- `lan-subnet` / `lan-subnet-mask`: Define your LAN network
-- `window-size`: Statistical analysis window (default 10s)
-- `class-1-threshold`: ML probability threshold for streaming classification (default 0.6)
-- `streaming-limit-seconds`: Daily quota per client (default 3600s = 1 hour)
+### Quota
+Default: 3600 seconds (1 hour). Change with `-q`:
+```bash
+sudo ./streamguard -i eno1 -e -q 7200  # 2 hours
+```
+
+### LAN Subnet
+Default: 192.168.0.0/24. Change with `-s` and `-m`:
+```bash
+sudo ./streamguard -i eno1 -s 192.168.1.0 -m 255.255.255.0
+```
+
+### State File
+Default: `streamguard_state.json` in current directory. Change with `-f`:
+```bash
+sudo ./streamguard -i eno1 -f /var/lib/streamguard/state.json
+```
 
 ## Dependencies
 
-Install with pip:
+### Ubuntu
 ```bash
-pip install pandas scapy joblib numpy
+sudo apt install libndpi-dev libpcap-dev libcjson-dev build-essential
 ```
 
-Router requires: `tcpdump`, `nftables`
+### OpenWrt
+```bash
+opkg install tcpdump
+```
 
-## Training Workflow
+## Log Output
 
-1. Collect raw packet data for different scenarios (video streaming, normal browsing, audio-only, etc.)
-2. Save to CSV files with `--train` flag
-3. Manually label scenarios (class 0 = not streaming, class 1 = streaming)
-4. Process through `feature_creation.py` to extract statistical features
-5. Train ExtraTree model, serialize to `etree.joblib`
-6. Feature selection already performed (11 best features in `config['selected_features']`)
+```
+[STREAMING] QUIC.YouTube | 192.168.0.10:54321 -> 142.250.1.1:443
+[FLOW_END] QUIC.YouTube | 192.168.0.10:54321 -> 142.250.1.1:443 | 5.2 MB | 45 sec
+[QUOTA] 192.168.0.10 | total: 2845/3600 seconds (47.4 min, 79%)
+[BLOCKED] 192.168.0.10 (quota exceeded: 3612/3600 seconds)
+[RESET] 192.168.0.10: 3612 seconds -> 0 (new day: 2026-01-06)
+```
 
-Existing training data categories in `python/training/Readme.md`:
-- YouTube videos (various lengths, including shorts)
-- Instagram scrolling/videos
-- Normal work activities (Teams, Outlook, web browsing)
-- Idle (locked screen)
+## Legacy Code (Deprecated)
 
-Still needed: Audio streaming (Spotify, Audible) to improve negative class examples.
+The `python/` directory contains deprecated approaches:
+- `python/naive_*.py` - Throughput-based detection (replaced by nDPI)
+- `python/scapy_sniffer.py` - ML-based classification (has buffering accuracy issues)
 
-## Known Issues / TODOs
-
-1. **Buffering detection**: Current ML approach only catches bursts, doesn't account for ABR buffering patterns (naive branch addresses this)
-2. **blocker.py integration**: Currently commented out in scapy_sniffer.py, needs activation and testing
-3. **Provider aggregation**: Should track state per (client, provider) rather than individual IPs, since CDNs rotate IPs
-4. **Minimum session length**: Add filter to ignore sessions <10s (previews/thumbnails)
-5. **Cooldown mechanism**: Add grace period (30s) before blocking to show warning message
-6. **SNI/DNS labeling**: Optional enhancement to identify providers (YouTube, Netflix) via TLS SNI or DNS logs
-7. **Feature engineering**: Current approach may need rethinking - consider per-(client, server) pair features rather than per-client aggregation
-
-## Architecture Notes
-
-- The system runs on separate hardware from the router (Orange Pi 5 or similar SBC) due to Python/ML requirements
-- tcpdump on router forwards raw packets via SSH to SBC for processing
-- Only header data captured (192-1024 bytes per packet) since payloads are encrypted
-- Enforcement via router's nftables allows O(1) blocking lookups with concatenated sets
-- State persistence in JSON allows script restarts without losing usage tracking
+**Use the C implementation (`src/streamguard.c`) for production.**

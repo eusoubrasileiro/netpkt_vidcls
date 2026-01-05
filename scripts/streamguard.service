@@ -1,0 +1,36 @@
+[Unit]
+Description=StreamGuard Video Streaming Quota Enforcement
+Documentation=https://github.com/yourusername/streamguard
+After=network.target
+
+[Service]
+Type=simple
+
+# Run as root to capture packets
+User=root
+
+# Main executable with sensible defaults
+# Adjust -i (interface), -q (quota seconds), and -s/-m (subnet/mask) as needed
+ExecStart=/usr/local/bin/streamguard -i eth0 -e -q 3600 -f /var/lib/streamguard/state.json
+
+# State directory - systemd creates this automatically
+StateDirectory=streamguard
+
+# Restart on failure
+Restart=on-failure
+RestartSec=5
+
+# Graceful shutdown
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Security hardening (still needs CAP_NET_RAW for pcap)
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/streamguard
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# Build artifacts
+src/streamguard
+*.o
+
+# Runtime state and logs
+*_state.json
+*.log
+
+# IDE
+.vscode/
+
+# Python (legacy - removed)
+__pycache__/
+*.pyc
+venv/
+*.h5
+
+# Claude Code
+.claude/
