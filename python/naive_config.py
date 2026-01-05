@@ -25,11 +25,12 @@ NAIVE_CONFIG = {
     'cooldown_seconds': 30,       # grace period before first block
     'progressive_blocking': True, # block one server at a time
 
-    # Optional refinements (Phase 3 - disabled for now)
-    'use_ewma': False,            # enable EWMA smoothing
-    'ewma_alpha': 0.3,            # EWMA weight
-    'use_buffer_credit': False,   # enable buffer accounting
-    'max_buffer_seconds': 90,     # max buffer credit
+    # Phase 3 refinements (DISABLED - experimental, increases false positives)
+    'use_ewma': False,            # EWMA smoothing (tested, increases FP from 2.5% to 16%)
+    'ewma_alpha': 0.3,            # EWMA weight (higher = more responsive)
+    'use_buffer_credit': False,   # buffer accounting (tested, no measurable improvement)
+    'max_buffer_seconds': 30,     # max buffer credit
+    'estimated_video_bitrate': 500_000,  # bytes/sec for buffer calculation
 
     # State persistence and logging
     'state_file': pathlib.Path(__file__).parent / 'naive_state.json',

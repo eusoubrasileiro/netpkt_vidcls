@@ -24,6 +24,8 @@ class FlowState:
     consecutive_high: int = 0  # consecutive windows above threshold
     is_streaming: bool = False
     last_packet_time: Optional[datetime] = None
+    ewma_rate: float = 0.0  # Smoothed rate for EWMA
+    buffer_credit_seconds: float = 0.0  # Buffer credit for ABR accounting
 
 
 @dataclass
@@ -161,19 +163,55 @@ class NaiveTracker:
                 rate = bytes_in_window / window_size
                 rate_kbps = rate * 8 / 1000  # Convert to kbps for logging
 
+                # Apply EWMA smoothing if enabled
+                if self.config.get('use_ewma', False):
+                    alpha = self.config.get('ewma_alpha', 0.3)
+                    flow.ewma_rate = (1 - alpha) * flow.ewma_rate + alpha * rate
+                    effective_rate = flow.ewma_rate
+                else:
+                    effective_rate = rate
+
+                # Apply buffer-credit accounting if enabled
+                # Only accumulate buffer credit when already confirmed as streaming
+                # to avoid false positives from occasional browsing bursts
+                if self.config.get('use_buffer_credit', False):
+                    max_buffer = self.config.get('max_buffer_seconds', 90)
+                    estimated_bitrate = self.config.get('estimated_video_bitrate', 500_000)
+
+                    if rate >= rate_threshold:
+                        # Only accumulate buffer credit if already streaming
+                        if flow.is_streaming:
+                            buffer_added = bytes_in_window / estimated_bitrate
+                            flow.buffer_credit_seconds = min(
+                                flow.buffer_credit_seconds + buffer_added,
+                                max_buffer
+                            )
+                    else:
+                        # Silent: deplete buffer at 1x playback speed
+                        flow.buffer_credit_seconds = max(
+                            flow.buffer_credit_seconds - window_size,
+                            0
+                        )
+
+                    # Consider streaming if rate high OR buffer not empty (but only if was streaming)
+                    is_above_threshold = (effective_rate >= rate_threshold) or (flow.is_streaming and flow.buffer_credit_seconds > 0)
+                else:
+                    is_above_threshold = (effective_rate >= rate_threshold)
+
                 was_streaming = flow.is_streaming
 
-                # Check if rate exceeds threshold
-                if rate >= rate_threshold:
+                # Check if above threshold (rate or buffer credit)
+                if is_above_threshold:
                     flow.consecutive_high += 1
                     if flow.consecutive_high >= consecutive_required and not flow.is_streaming:
                         flow.is_streaming = True
+                        buffer_info = f" | buffer={flow.buffer_credit_seconds:.1f}s" if self.config.get('use_buffer_credit', False) else ""
                         self.logger.info(
                             f"STREAMING_START | client={client_ip} | server={server_ip} | "
-                            f"rate={rate_kbps:.0f}kbps | consecutive={flow.consecutive_high}"
+                            f"rate={rate_kbps:.0f}kbps | consecutive={flow.consecutive_high}{buffer_info}"
                         )
                 else:
-                    # Rate dropped below threshold
+                    # Rate dropped below threshold and buffer empty
                     if flow.is_streaming:
                         flow.is_streaming = False
                         self.logger.info(
@@ -188,10 +226,11 @@ class NaiveTracker:
                 # Verbose per-flow logging
                 if self.verbose:
                     status = "STREAM" if flow.is_streaming else "idle"
+                    buffer_info = f" | buf={flow.buffer_credit_seconds:.1f}s" if self.config.get('use_buffer_credit', False) else ""
                     self.logger.debug(
                         f"FLOW | {client_ip} -> {server_ip} | "
                         f"{bytes_in_window:>8} B | {rate_kbps:>6.0f} kbps | "
-                        f"consec={flow.consecutive_high} | {status}"
+                        f"consec={flow.consecutive_high}{buffer_info} | {status}"
                     )
 
             # Update client watch time
@@ -248,7 +287,8 @@ class NaiveTracker:
         if not client:
             return {}
 
-        now = datetime.now()
+        # Use last packet timestamp for historical data compatibility
+        now = self.window_end or datetime.now()
         current_watch = client.watch_time_seconds
         if client.streaming_start:
             current_watch += (now - client.streaming_start).total_seconds()
