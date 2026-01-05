@@ -6,7 +6,7 @@ CC = gcc
 NDPI_LOCAL = ../nDPI
 ifneq ($(wildcard $(NDPI_LOCAL)/src/lib/libndpi.a),)
     NDPI_CFLAGS = -I$(NDPI_LOCAL)/src/include
-    NDPI_LIBS = $(NDPI_LOCAL)/src/lib/libndpi.a -lm -lpthread
+    NDPI_LIBS = $(NDPI_LOCAL)/src/lib/libndpi.a -lm -lpthread -lgcrypt -lgpg-error
 else
     NDPI_CFLAGS = $(shell pkg-config --cflags libndpi)
     NDPI_LIBS = $(shell pkg-config --libs libndpi)

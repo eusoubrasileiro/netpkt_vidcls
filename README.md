@@ -22,38 +22,54 @@ Kids' Devices ──► OpenWrt Router ──► Internet
 
 **Ubuntu machine:**
 ```bash
-sudo apt install libndpi-dev libpcap-dev libcjson-dev build-essential
+# Install all build dependencies
+sudo apt install build-essential git autoconf automake libtool pkg-config \
+    libpcap-dev libcjson-dev libgcrypt20-dev libgpg-error-dev \
+    flex bison libjson-c-dev libnuma-dev libpcre2-dev libmaxminddb-dev librrd-dev
 ```
-
-> **Note:** For best detection (modern QUIC/YouTube), consider building nDPI from source - see [CLAUDE.md](CLAUDE.md#upgrading-ndpi-recommended).
 
 **OpenWrt router:**
 - Root SSH access
 - tcpdump: `opkg install tcpdump`
 
-### 1. Build
+### 1. Build nDPI 5.0 (Required)
 
 ```bash
 git clone https://github.com/yourusername/streamguard.git
-cd streamguard/src
+cd streamguard
+
+# Build nDPI 5.0 with libgcrypt support
+git clone --branch 5.0 --depth 1 https://github.com/ntop/nDPI.git nDPI
+cd nDPI
+./autogen.sh
+./configure --with-local-libgcrypt
+make -j$(nproc)
+sudo make install && sudo ldconfig
+cd ..
+```
+
+### 2. Build StreamGuard
+
+```bash
+cd src
 make
 ```
 
-### 2. Setup SSH Key Auth to Router
+### 3. Setup SSH Key Auth to Router
 
 ```bash
 ssh-copy-id root@192.168.0.1
 ssh root@192.168.0.1 "echo OK"  # Should work without password
 ```
 
-### 3. Configure Router
+### 4. Configure Router
 
 ```bash
 cd scripts/openwrt
 ./install.sh 192.168.0.1
 ```
 
-### 4. Test (Dry-Run Mode)
+### 5. Test (Dry-Run Mode)
 
 ```bash
 sudo ./streamguard -i eno1  # Replace eno1 with your interface
@@ -61,7 +77,7 @@ sudo ./streamguard -i eno1  # Replace eno1 with your interface
 
 Watch YouTube on a device - you should see detection logs.
 
-### 5. Enable Enforcement
+### 6. Enable Enforcement
 
 ```bash
 sudo ./streamguard -i eno1 -e -q 3600  # 1 hour quota

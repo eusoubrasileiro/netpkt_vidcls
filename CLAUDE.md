@@ -41,11 +41,10 @@ Ubuntu Machine (StreamGuard)              OpenWrt Router
 Rather than hardcoding individual protocols (YouTube, Netflix, etc.), StreamGuard uses nDPI's **protocol categories**:
 
 ```c
-ndpi_protocol_category_t cat = ndpi_get_proto_category(ndpi_module, proto);
-
-return (cat == NDPI_PROTOCOL_CATEGORY_VIDEO ||
-        cat == NDPI_PROTOCOL_CATEGORY_STREAMING ||
-        cat == NDPI_PROTOCOL_CATEGORY_MEDIA);
+/* nDPI 5.0: category is directly in ndpi_protocol struct */
+return (proto.category == NDPI_PROTOCOL_CATEGORY_VIDEO ||
+        proto.category == NDPI_PROTOCOL_CATEGORY_STREAMING ||
+        proto.category == NDPI_PROTOCOL_CATEGORY_MEDIA);
 ```
 
 **Benefits:**
@@ -168,9 +167,11 @@ sudo ./streamguard -i eno1 -f /var/lib/streamguard/state.json
 
 ## Dependencies
 
-### Ubuntu
+### Ubuntu - Build Dependencies
 ```bash
-sudo apt install libndpi-dev libpcap-dev libcjson-dev build-essential
+sudo apt install build-essential git autoconf automake libtool pkg-config \
+    libpcap-dev libcjson-dev libgcrypt20-dev libgpg-error-dev \
+    flex bison libjson-c-dev libnuma-dev libpcre2-dev libmaxminddb-dev librrd-dev
 ```
 
 ### OpenWrt
@@ -178,25 +179,25 @@ sudo apt install libndpi-dev libpcap-dev libcjson-dev build-essential
 opkg install tcpdump
 ```
 
-### Upgrading nDPI (Recommended)
+### Building nDPI 5.0 (Required)
 
-The Ubuntu package (libndpi-dev) may be outdated and miss modern QUIC/YouTube detection. For best results, build nDPI from source:
+The Ubuntu package (libndpi-dev 4.2.0) is outdated. StreamGuard requires nDPI 5.0 built from source with libgcrypt support for proper QUIC/YouTube detection.
 
 ```bash
-# Remove old package
-sudo apt remove libndpi-dev
+# Clone nDPI 5.0 into the project
+cd /path/to/streamguard
+git clone --branch 5.0 --depth 1 https://github.com/ntop/nDPI.git nDPI
 
-# Build from source
-git clone https://github.com/ntop/nDPI.git
+# Build with libgcrypt support
 cd nDPI
 ./autogen.sh
-./configure
-make
+./configure --with-local-libgcrypt
+make -j$(nproc)
 sudo make install
 sudo ldconfig
 ```
 
-Then rebuild StreamGuard.
+The Makefile automatically uses the local `nDPI/` build if present.
 
 ## Log Output
 
@@ -211,8 +212,28 @@ Then rebuild StreamGuard.
 
 ## Known Issues
 
-1. **nDPI 4.2.0 (Ubuntu package)** - May not detect modern QUIC/YouTube properly. Build nDPI from source for better detection.
+1. **nDPI 4.2.0 (Ubuntu package)** - Does not detect modern QUIC/YouTube. Must build nDPI 5.0 from source with `--with-local-libgcrypt`.
 
 2. **Flow duration at shutdown** - Fixed. Previously showed 40+ year durations due to timestamp underflow.
 
 3. **False positives on static pages** - Fixed. Throughput filtering now excludes low-bandwidth flows.
+
+## nDPI 5.0 API Notes
+
+StreamGuard uses nDPI 5.0 API which differs from older versions:
+
+```c
+/* Initialization - no bitmask needed, all protocols enabled by default */
+ndpi_module = ndpi_init_detection_module(NULL);
+ndpi_finalize_initialization(ndpi_module);
+
+/* Detection - extra input_info parameter */
+ndpi_detection_process_packet(ndpi_module, flow, packet, len, time_ms, NULL);
+
+/* Giveup - only 2 parameters */
+ndpi_detection_giveup(ndpi_module, flow);
+
+/* Protocol access - nested struct */
+flow->detected_protocol.proto.app_protocol
+flow->detected_protocol.category  /* category directly accessible */
+```
