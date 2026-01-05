@@ -7,8 +7,39 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Real-time network packet analysis to identify video streaming traffic and enforce daily time quotas. When a client exceeds their quota, the system blocks specific `(client_ip, server_ip)` pairs using nftables on an OpenWrt router.
 
 **Two approaches:**
-- **naive branch** (current): Throughput-based tracking using EWMA, hysteresis, and buffer-credit accounting
-- **main branch**: ML-based classification using ExtraTree model with packet header features
+- **naive branch** (RECOMMENDED): Throughput-based tracking using EWMA, hysteresis, and buffer-credit accounting
+- **main branch** (DEPRECATED): ML-based classification using ExtraTree model with packet header features
+
+## ⚠️ CRITICAL: Which Approach to Use?
+
+**USE THE NAIVE APPROACH.** The ML approach has a fundamental flaw that makes it unsuitable for quota enforcement.
+
+### The Buffering Problem (Why ML Fails)
+
+Modern video streaming uses adaptive bitrate (ABR) with segment-based delivery:
+- **Burst phase** (2-3s): Downloads 6s of video at high speed
+- **Silent phase** (3-4s): Player buffers, no network traffic
+- **ML counts only burst time** → 30min video = ~10min detected ❌
+- **Naive counts correctly** → Tracks buffer credit during silence ✅
+
+### Quick Comparison
+
+| Criterion | ML Approach | Naive Approach |
+|-----------|-------------|----------------|
+| **Time accuracy** | ❌ 30-40% of actual | ✅ ~95% accurate |
+| **Code complexity** | ❌ 500+ lines | ✅ ~60 lines |
+| **Maintenance** | ❌ Retrain model | ✅ Adjust thresholds |
+| **False positives** | ✅ ~7% | ⚠️ ~20% (acceptable) |
+| **Detection delay** | ⚠️ 30s | ✅ 9-15s |
+
+**Verdict:** Naive approach is significantly better for this use case.
+
+### Implementation Status
+
+- **ML approach (main branch):** Fully implemented but fundamentally flawed
+- **Naive approach (naive branch):** Pseudocode in README (lines 192-264), NOT YET IMPLEMENTED
+
+**See `IMPLEMENTATION_PLAN.md` for detailed naive implementation plan.**
 
 ## Common Commands
 
