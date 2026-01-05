@@ -2,6 +2,9 @@
 src/streamguard
 *.o
 
+# nDPI (build from source separately)
+nDPI/
+
 # Runtime state and logs
 *_state.json
 *.log

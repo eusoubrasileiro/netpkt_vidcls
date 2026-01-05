@@ -1,8 +1,19 @@
 # StreamGuard Makefile
 
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 $(shell pkg-config --cflags libndpi)
-LDFLAGS = $(shell pkg-config --libs libndpi) -lpcap -lcjson
+
+# Use local nDPI build (../nDPI) if available, otherwise system pkg-config
+NDPI_LOCAL = ../nDPI
+ifneq ($(wildcard $(NDPI_LOCAL)/src/lib/libndpi.a),)
+    NDPI_CFLAGS = -I$(NDPI_LOCAL)/src/include
+    NDPI_LIBS = $(NDPI_LOCAL)/src/lib/libndpi.a -lm -lpthread
+else
+    NDPI_CFLAGS = $(shell pkg-config --cflags libndpi)
+    NDPI_LIBS = $(shell pkg-config --libs libndpi)
+endif
+
+CFLAGS = -Wall -Wextra -O2 $(NDPI_CFLAGS)
+LDFLAGS = $(NDPI_LIBS) -lpcap -lcjson
 
 TARGET = streamguard
 SRC = streamguard.c

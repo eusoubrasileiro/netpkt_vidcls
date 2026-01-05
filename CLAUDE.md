@@ -6,7 +6,7 @@ Developer reference for Claude Code when working with this repository.
 
 **StreamGuard** - Real-time video streaming detection and daily quota enforcement for home networks.
 
-Uses **nDPI** (Deep Packet Inspection) to identify streaming protocols (YouTube, Netflix, TikTok, etc.) and blocks clients via **nftables** when they exceed their daily quota.
+Uses **nDPI** (Deep Packet Inspection) to identify streaming protocols and blocks clients via **nftables** when they exceed their daily quota.
 
 ## Architecture
 
@@ -27,11 +27,46 @@ Ubuntu Machine (StreamGuard)              OpenWrt Router
 
 **How it works:**
 1. StreamGuard captures packets on Ubuntu machine
-2. nDPI identifies streaming protocols (YouTube, Netflix, etc.)
-3. Per-client watch time accumulated, saved to JSON
-4. When quota exceeded, client IP added to router's nftables blocked set
-5. Router drops traffic from blocked clients to streaming destinations
-6. Quotas reset daily at midnight
+2. nDPI detects protocol and determines its category (VIDEO, STREAMING, MEDIA)
+3. Only flows with throughput >100KB/s are counted (filters out static pages)
+4. Per-client watch time accumulated, saved to JSON
+5. When quota exceeded, client IP added to router's nftables blocked set
+6. Router drops traffic from blocked clients to streaming destinations
+7. Quotas reset daily at midnight
+
+## Detection Approach
+
+### Category-Based Detection
+
+Rather than hardcoding individual protocols (YouTube, Netflix, etc.), StreamGuard uses nDPI's **protocol categories**:
+
+```c
+ndpi_protocol_category_t cat = ndpi_get_proto_category(ndpi_module, proto);
+
+return (cat == NDPI_PROTOCOL_CATEGORY_VIDEO ||
+        cat == NDPI_PROTOCOL_CATEGORY_STREAMING ||
+        cat == NDPI_PROTOCOL_CATEGORY_MEDIA);
+```
+
+**Benefits:**
+- Future-proof: New services auto-detected by category
+- No hardcoded protocol list to maintain
+- Works even when nDPI doesn't have specific service detection
+
+### Throughput Filtering
+
+To avoid counting static pages (Facebook developer docs, YouTube homepage, etc.) as streaming:
+
+```c
+#define MIN_STREAMING_RATE 100000  /* 100KB/s minimum */
+
+uint64_t bytes_per_sec = (f->bytes * 1000) / duration_ms;
+if (bytes_per_sec < MIN_STREAMING_RATE) {
+    /* Skip - not actual video playback */
+}
+```
+
+A 720p video uses ~2-5 Mbps (250-625 KB/s). 100KB/s is a conservative threshold.
 
 ## Key Files
 
@@ -97,17 +132,19 @@ Options:
 Without -e, runs in dry-run mode (logs only, no blocking).
 ```
 
-## Detected Protocols
+## Detected Categories
 
-StreamGuard detects these streaming services via nDPI:
+StreamGuard detects traffic in these nDPI categories:
 
-**Video Streaming:**
-- YouTube, Netflix, TikTok, Twitch
-- Disney+, Amazon Video, Hulu
-- Instagram, Facebook video
+- **NDPI_PROTOCOL_CATEGORY_VIDEO** - YouTube, Netflix, TikTok, etc.
+- **NDPI_PROTOCOL_CATEGORY_STREAMING** - Live streaming services
+- **NDPI_PROTOCOL_CATEGORY_MEDIA** - General media content
+
+Social media with video (Instagram, Facebook) is also detected when actively streaming video content.
 
 **Not Tracked (by design):**
-- Spotify, Apple Music (audio only)
+- Audio-only services (Spotify, Apple Music) - different category
+- Low-throughput browsing (<100KB/s) on video sites
 
 ## Configuration
 
@@ -141,20 +178,41 @@ sudo apt install libndpi-dev libpcap-dev libcjson-dev build-essential
 opkg install tcpdump
 ```
 
+### Upgrading nDPI (Recommended)
+
+The Ubuntu package (libndpi-dev) may be outdated and miss modern QUIC/YouTube detection. For best results, build nDPI from source:
+
+```bash
+# Remove old package
+sudo apt remove libndpi-dev
+
+# Build from source
+git clone https://github.com/ntop/nDPI.git
+cd nDPI
+./autogen.sh
+./configure
+make
+sudo make install
+sudo ldconfig
+```
+
+Then rebuild StreamGuard.
+
 ## Log Output
 
 ```
 [STREAMING] QUIC.YouTube | 192.168.0.10:54321 -> 142.250.1.1:443
-[FLOW_END] QUIC.YouTube | 192.168.0.10:54321 -> 142.250.1.1:443 | 5.2 MB | 45 sec
+[FLOW_END] QUIC.YouTube | 192.168.0.10:54321 -> 142.250.1.1:443 | 5.2 MB | 45 sec | 118 KB/s
 [QUOTA] 192.168.0.10 | total: 2845/3600 seconds (47.4 min, 79%)
+[SKIP] Low throughput flow (12 KB/s < 100 KB/s), not counting
 [BLOCKED] 192.168.0.10 (quota exceeded: 3612/3600 seconds)
 [RESET] 192.168.0.10: 3612 seconds -> 0 (new day: 2026-01-06)
 ```
 
-## Legacy Code (Deprecated)
+## Known Issues
 
-The `python/` directory contains deprecated approaches:
-- `python/naive_*.py` - Throughput-based detection (replaced by nDPI)
-- `python/scapy_sniffer.py` - ML-based classification (has buffering accuracy issues)
+1. **nDPI 4.2.0 (Ubuntu package)** - May not detect modern QUIC/YouTube properly. Build nDPI from source for better detection.
 
-**Use the C implementation (`src/streamguard.c`) for production.**
+2. **Flow duration at shutdown** - Fixed. Previously showed 40+ year durations due to timestamp underflow.
+
+3. **False positives on static pages** - Fixed. Throughput filtering now excludes low-bandwidth flows.

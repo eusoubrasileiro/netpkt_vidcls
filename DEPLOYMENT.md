@@ -139,9 +139,12 @@ StreamGuard - Video Streaming Quota Enforcement
 Interface: eno1 | LAN: 192.168.0.0/255.255.255.0 | Quota: 3600 sec | Mode: DRY-RUN
 
 [STREAMING] QUIC.YouTube | 192.168.0.45:52341 -> 142.250.80.46:443
-[FLOW_END] QUIC.YouTube | 192.168.0.45:52341 -> 142.250.80.46:443 | 2.1 MB | 23 sec
+[FLOW_END] QUIC.YouTube | 192.168.0.45:52341 -> 142.250.80.46:443 | 2.1 MB | 23 sec | 91 KB/s
+[SKIP] Low throughput flow (12 KB/s < 100 KB/s), not counting
 [QUOTA] 192.168.0.45 | total: 23/3600 seconds (0.4 min, 1%)
 ```
+
+Note: Flows with <100KB/s throughput are skipped (filters out thumbnails/static pages).
 
 Press `Ctrl+C` to stop.
 

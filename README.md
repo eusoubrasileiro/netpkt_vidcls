@@ -25,6 +25,8 @@ Kids' Devices ──► OpenWrt Router ──► Internet
 sudo apt install libndpi-dev libpcap-dev libcjson-dev build-essential
 ```
 
+> **Note:** For best detection (modern QUIC/YouTube), consider building nDPI from source - see [CLAUDE.md](CLAUDE.md#upgrading-ndpi-recommended).
+
 **OpenWrt router:**
 - Root SSH access
 - tcpdump: `opkg install tcpdump`
@@ -78,9 +80,16 @@ Options:
   -h           Help
 ```
 
-## Detected Services
+## Detection
 
-YouTube, Netflix, TikTok, Twitch, Disney+, Amazon Video, Hulu, Instagram, Facebook
+StreamGuard uses nDPI's **protocol categories** to detect streaming:
+- `VIDEO` - YouTube, Netflix, TikTok, etc.
+- `STREAMING` - Live streaming services
+- `MEDIA` - General media content
+
+Only flows with **>100KB/s throughput** are counted (filters out static pages/thumbnails).
+
+**Detected Services:** YouTube, Netflix, TikTok, Twitch, Disney+, Amazon Video, Hulu, Instagram, Facebook
 
 ## Run as Service
 

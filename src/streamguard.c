@@ -22,7 +22,7 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <pcap.h>
-#include <ndpi/ndpi_api.h>
+#include <ndpi_api.h>
 #include <cjson/cJSON.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -33,6 +33,7 @@
 #define FLOW_IDLE_TIMEOUT 30  /* seconds */
 #define LAN_SUBNET "192.168.0.0"
 #define LAN_MASK "255.255.255.0"
+#define MIN_STREAMING_RATE 100000  /* 100KB/s minimum to count as streaming */
 
 /* Flow tracking structure */
 struct flow_info {
@@ -84,32 +85,12 @@ static uint64_t daily_quota = 3600;  /* seconds */
 static time_t last_state_save = 0;
 static char *state_file_path = NULL;
 
-/* Streaming protocol IDs we care about */
-static int is_streaming_protocol(ndpi_protocol proto) {
-    uint16_t app = proto.app_protocol;
-    uint16_t master = proto.master_protocol;
-
-    /* Check both master and app protocol */
-    uint16_t p = (app != NDPI_PROTOCOL_UNKNOWN) ? app : master;
-
-    switch (p) {
-        /* Video Streaming */
-        case NDPI_PROTOCOL_YOUTUBE:
-        case NDPI_PROTOCOL_NETFLIX:
-        case NDPI_PROTOCOL_TIKTOK:
-        case NDPI_PROTOCOL_TWITCH:
-        case NDPI_PROTOCOL_DISNEYPLUS:
-        case NDPI_PROTOCOL_AMAZON_VIDEO:
-        case NDPI_PROTOCOL_HULU:
-        /* Social Media (often has video) */
-        case NDPI_PROTOCOL_INSTAGRAM:
-        case NDPI_PROTOCOL_FACEBOOK:
-        case NDPI_PROTOCOL_SNAPCHAT:
-        case NDPI_PROTOCOL_WHATSAPP:
-            return 1;
-        default:
-            return 0;
-    }
+/* Check if protocol is in a streaming category (VIDEO, STREAMING, or MEDIA) */
+static int is_streaming_category(ndpi_protocol proto) {
+    /* nDPI 5.0: category is directly in ndpi_protocol struct */
+    return (proto.category == NDPI_PROTOCOL_CATEGORY_VIDEO ||
+            proto.category == NDPI_PROTOCOL_CATEGORY_STREAMING ||
+            proto.category == NDPI_PROTOCOL_CATEGORY_MEDIA);
 }
 
 /* Check if IP is in LAN */
@@ -406,8 +387,8 @@ static void expire_flows(void) {
         if (!f->in_use) continue;
 
         if ((now_ms - f->last_seen_ms) > (FLOW_IDLE_TIMEOUT * 1000)) {
-            /* Flow expired - log if streaming */
-            if (f->detection_completed && is_streaming_protocol(f->detected_protocol)) {
+            /* Flow expired - check if streaming category */
+            if (f->detection_completed && is_streaming_category(f->detected_protocol)) {
                 char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
                 struct in_addr src_addr = { .s_addr = f->src_ip };
                 struct in_addr dst_addr = { .s_addr = f->dst_ip };
@@ -415,13 +396,25 @@ static void expire_flows(void) {
                 inet_ntop(AF_INET, &dst_addr, dst_str, sizeof(dst_str));
 
                 /* Duration in seconds (from milliseconds) */
-                uint32_t duration_sec = (f->last_seen_ms - f->first_seen_ms) / 1000;
+                uint64_t duration_ms = f->last_seen_ms - f->first_seen_ms;
+                uint32_t duration_sec = duration_ms / 1000;
                 char proto_name[64];
-                ndpi_protocol2name(ndpi_module, f->detected_protocol, proto_name, sizeof(proto_name));
+                ndpi_protocol2name(ndpi_module, f->detected_protocol.proto, proto_name, sizeof(proto_name));
 
-                printf("[FLOW_END] %s | %s:%d -> %s:%d | %lu bytes | %u sec\n",
+                /* Calculate throughput - only count as streaming if high enough */
+                uint64_t bytes_per_sec = (duration_ms > 0) ? (f->bytes * 1000 / duration_ms) : 0;
+
+                printf("[FLOW_END] %s | %s:%d -> %s:%d | %lu bytes | %u sec | %lu KB/s\n",
                        proto_name, src_str, ntohs(f->src_port),
-                       dst_str, ntohs(f->dst_port), f->bytes, duration_sec);
+                       dst_str, ntohs(f->dst_port), f->bytes, duration_sec, bytes_per_sec / 1000);
+
+                /* Only count toward quota if throughput > MIN_STREAMING_RATE */
+                if (bytes_per_sec < MIN_STREAMING_RATE) {
+                    printf("[SKIP] Low throughput flow (%lu KB/s < %d KB/s), not counting\n",
+                           bytes_per_sec / 1000, MIN_STREAMING_RATE / 1000);
+                    free_flow(f);
+                    continue;
+                }
 
                 /* Update client quota */
                 uint32_t client_ip = is_lan_ip(f->src_ip) ? f->src_ip : f->dst_ip;
@@ -509,21 +502,22 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
             flow->ndpi_flow,
             (uint8_t *)ip_header,
             ntohs(ip_header->ip_len),
-            time_ms
+            time_ms,
+            NULL  /* input_info - nDPI 5.0 */
         );
 
         /* Check if detection is done */
-        if (flow->detected_protocol.app_protocol != NDPI_PROTOCOL_UNKNOWN ||
+        if (flow->detected_protocol.proto.app_protocol != NDPI_PROTOCOL_UNKNOWN ||
             flow->packets > 10) {
 
-            if (flow->detected_protocol.app_protocol == NDPI_PROTOCOL_UNKNOWN) {
+            if (flow->detected_protocol.proto.app_protocol == NDPI_PROTOCOL_UNKNOWN) {
                 flow->detected_protocol = ndpi_detection_giveup(
-                    ndpi_module, flow->ndpi_flow, 1, &flow->detection_completed);
+                    ndpi_module, flow->ndpi_flow);  /* nDPI 5.0: only 2 params */
             }
             flow->detection_completed = 1;
 
             /* Log new streaming flow */
-            if (is_streaming_protocol(flow->detected_protocol)) {
+            if (is_streaming_category(flow->detected_protocol)) {
                 char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
                 struct in_addr src_addr = { .s_addr = src_ip };
                 struct in_addr dst_addr = { .s_addr = dst_ip };
@@ -531,7 +525,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
                 inet_ntop(AF_INET, &dst_addr, dst_str, sizeof(dst_str));
 
                 char proto_name[64];
-                ndpi_protocol2name(ndpi_module, flow->detected_protocol, proto_name, sizeof(proto_name));
+                ndpi_protocol2name(ndpi_module, flow->detected_protocol.proto, proto_name, sizeof(proto_name));
 
                 printf("[STREAMING] %s | %s:%d -> %s:%d\n",
                        proto_name, src_str, ntohs(src_port),
@@ -595,17 +589,13 @@ int main(int argc, char *argv[]) {
            interface, subnet, mask, daily_quota,
            enforce_mode ? "ENFORCE" : "DRY-RUN");
 
-    /* Initialize nDPI */
-    NDPI_PROTOCOL_BITMASK all;
-    NDPI_BITMASK_SET_ALL(all);
-
-    ndpi_module = ndpi_init_detection_module(ndpi_no_prefs);
+    /* Initialize nDPI (5.0 API - all protocols enabled by default) */
+    ndpi_module = ndpi_init_detection_module(NULL);
     if (!ndpi_module) {
         fprintf(stderr, "Failed to initialize nDPI\n");
         return 1;
     }
 
-    ndpi_set_protocol_detection_bitmask2(ndpi_module, &all);
     ndpi_finalize_initialization(ndpi_module);
 
     printf("nDPI initialized (version %s)\n", ndpi_revision());
@@ -668,9 +658,11 @@ int main(int argc, char *argv[]) {
     save_state();
 
     /* Final expiration to log remaining flows */
+    uint64_t now_ms = get_time_ms();
     for (int i = 0; i < MAX_FLOWS; i++) {
         if (flows[i].in_use) {
-            flows[i].last_seen_ms = 0;  /* Force expiration */
+            /* Set to current time (not 0!) to get correct duration */
+            flows[i].last_seen_ms = now_ms - (FLOW_IDLE_TIMEOUT * 1000) - 1;
         }
     }
     expire_flows();
