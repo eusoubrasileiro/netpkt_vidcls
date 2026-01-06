@@ -28,12 +28,11 @@
 #include <errno.h>
 
 #define MAX_FLOWS 65536
-#define STATE_FILE "streamguard_state.json"
 #define SAVE_INTERVAL 60  /* seconds */
 #define FLOW_IDLE_TIMEOUT 30  /* seconds */
+#define SESSION_TIMEOUT 45000  /* 45 seconds - based on YouTube's ~30s buffer */
 #define LAN_SUBNET "192.168.0.0"
 #define LAN_MASK "255.255.255.0"
-#define MIN_STREAMING_RATE 100000  /* 100KB/s minimum to count as streaming */
 
 /* Flow tracking structure */
 struct flow_info {
@@ -63,6 +62,9 @@ struct client_info {
     char last_reset_date[16];  /* YYYY-MM-DD */
     uint8_t in_use;
     uint8_t is_blocked;
+    /* Session-based tracking */
+    uint64_t session_start_ms;          /* When current session started (0 = inactive) */
+    uint64_t last_streaming_activity_ms; /* Last streaming packet timestamp */
 };
 
 /* Get current time in milliseconds */
@@ -81,9 +83,11 @@ static volatile int running = 1;
 static uint32_t lan_network;
 static uint32_t lan_netmask;
 static int enforce_mode = 0;  /* 0=dry-run, 1=enforce */
+static int debug_mode = 0;   /* 0=normal, 1=verbose debug output */
 static uint64_t daily_quota = 3600;  /* seconds */
 static time_t last_state_save = 0;
 static char *state_file_path = NULL;
+static char *input_pcap = NULL;  /* Read from file instead of live capture */
 
 /* Check if protocol is in a streaming category (VIDEO, STREAMING, or MEDIA) */
 static int is_streaming_category(ndpi_protocol proto) {
@@ -96,6 +100,14 @@ static int is_streaming_category(ndpi_protocol proto) {
 /* Check if IP is in LAN */
 static int is_lan_ip(uint32_t ip) {
     return (ip & lan_netmask) == lan_network;
+}
+
+/* Convert IP to string (uses static buffer - not thread safe) */
+static const char *ip_to_str(uint32_t ip) {
+    static char buf[INET_ADDRSTRLEN];
+    struct in_addr addr = {.s_addr = ip};
+    inet_ntop(AF_INET, &addr, buf, sizeof(buf));
+    return buf;
 }
 
 /* Get client index from IP (assumes /24) */
@@ -112,10 +124,7 @@ static void get_current_date(char *buf, size_t len) {
 
 /* Block client via nftables */
 static void block_client(uint32_t client_ip) {
-    char ip_str[INET_ADDRSTRLEN];
-    struct in_addr addr = {.s_addr = client_ip};
-    inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-
+    const char *ip_str = ip_to_str(client_ip);
     int idx = get_client_index(client_ip);
     if (clients[idx].is_blocked) return;  /* Already blocked */
 
@@ -141,10 +150,7 @@ static void block_client(uint32_t client_ip) {
 
 /* Unblock client via nftables */
 static void unblock_client(uint32_t client_ip) {
-    char ip_str[INET_ADDRSTRLEN];
-    struct in_addr addr = {.s_addr = client_ip};
-    inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-
+    const char *ip_str = ip_to_str(client_ip);
     int idx = get_client_index(client_ip);
     if (!clients[idx].is_blocked) return;  /* Not blocked */
 
@@ -164,20 +170,18 @@ static void unblock_client(uint32_t client_ip) {
     }
 }
 
-/* Save state to JSON file */
+/* Save state to JSON file (only if -f specified) */
 static void save_state(void) {
+    if (!state_file_path) return;  /* State persistence disabled */
+
     cJSON *root = cJSON_CreateObject();
     cJSON *clients_arr = cJSON_CreateArray();
 
     for (int i = 0; i < 256; i++) {
         if (!clients[i].in_use) continue;
 
-        char ip_str[INET_ADDRSTRLEN];
-        struct in_addr addr = {.s_addr = clients[i].ip};
-        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-
         cJSON *client = cJSON_CreateObject();
-        cJSON_AddStringToObject(client, "ip", ip_str);
+        cJSON_AddStringToObject(client, "ip", ip_to_str(clients[i].ip));
         cJSON_AddNumberToObject(client, "streaming_seconds", clients[i].streaming_seconds);
         cJSON_AddStringToObject(client, "last_reset_date", clients[i].last_reset_date);
         cJSON_AddBoolToObject(client, "is_blocked", clients[i].is_blocked);
@@ -187,13 +191,12 @@ static void save_state(void) {
     cJSON_AddItemToObject(root, "clients", clients_arr);
 
     char *json_str = cJSON_Print(root);
-    const char *path = state_file_path ? state_file_path : STATE_FILE;
-    FILE *f = fopen(path, "w");
+    FILE *f = fopen(state_file_path, "w");
     if (f) {
         fputs(json_str, f);
         fclose(f);
     } else {
-        fprintf(stderr, "[WARN] Could not save state to %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "[WARN] Could not save state to %s: %s\n", state_file_path, strerror(errno));
     }
 
     free(json_str);
@@ -201,12 +204,13 @@ static void save_state(void) {
     last_state_save = time(NULL);
 }
 
-/* Load state from JSON file */
+/* Load state from JSON file (only if -f specified) */
 static void load_state(void) {
-    const char *path = state_file_path ? state_file_path : STATE_FILE;
-    FILE *f = fopen(path, "r");
+    if (!state_file_path) return;  /* State persistence disabled */
+
+    FILE *f = fopen(state_file_path, "r");
     if (!f) {
-        printf("No previous state file found (%s), starting fresh\n", path);
+        printf("No previous state file found (%s), starting fresh\n", state_file_path);
         return;
     }
 
@@ -266,7 +270,7 @@ static void load_state(void) {
     }
 
     cJSON_Delete(root);
-    printf("Loaded state for %d clients from %s\n", loaded, path);
+    printf("Loaded state for %d clients from %s\n", loaded, state_file_path);
 }
 
 /* Check if daily reset is needed */
@@ -281,13 +285,9 @@ static void check_daily_reset(void) {
         if (clients[i].last_reset_date[0] == '\0' ||
             strcmp(clients[i].last_reset_date, today) != 0) {
 
-            char ip_str[INET_ADDRSTRLEN];
-            struct in_addr addr = {.s_addr = clients[i].ip};
-            inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-
             if (clients[i].streaming_seconds > 0) {
                 printf("[RESET] %s: %lu seconds -> 0 (new day: %s)\n",
-                       ip_str, clients[i].streaming_seconds, today);
+                       ip_to_str(clients[i].ip), clients[i].streaming_seconds, today);
             }
 
             /* Unblock if was blocked */
@@ -387,64 +387,56 @@ static void expire_flows(void) {
         if (!f->in_use) continue;
 
         if ((now_ms - f->last_seen_ms) > (FLOW_IDLE_TIMEOUT * 1000)) {
-            /* Flow expired - check if streaming category */
-            if (f->detection_completed && is_streaming_category(f->detected_protocol)) {
+            /* Flow expired - log if debug mode and streaming category */
+            if (debug_mode && f->detection_completed && is_streaming_category(f->detected_protocol)) {
                 char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
                 struct in_addr src_addr = { .s_addr = f->src_ip };
                 struct in_addr dst_addr = { .s_addr = f->dst_ip };
                 inet_ntop(AF_INET, &src_addr, src_str, sizeof(src_str));
                 inet_ntop(AF_INET, &dst_addr, dst_str, sizeof(dst_str));
 
-                /* Duration in seconds (from milliseconds) */
                 uint64_t duration_ms = f->last_seen_ms - f->first_seen_ms;
                 uint32_t duration_sec = duration_ms / 1000;
                 char proto_name[64];
                 ndpi_protocol2name(ndpi_module, f->detected_protocol.proto, proto_name, sizeof(proto_name));
 
-                /* Calculate throughput - only count as streaming if high enough */
                 uint64_t bytes_per_sec = (duration_ms > 0) ? (f->bytes * 1000 / duration_ms) : 0;
 
                 printf("[FLOW_END] %s | %s:%d -> %s:%d | %lu bytes | %u sec | %lu KB/s\n",
                        proto_name, src_str, ntohs(f->src_port),
                        dst_str, ntohs(f->dst_port), f->bytes, duration_sec, bytes_per_sec / 1000);
-
-                /* Only count toward quota if throughput > MIN_STREAMING_RATE */
-                if (bytes_per_sec < MIN_STREAMING_RATE) {
-                    printf("[SKIP] Low throughput flow (%lu KB/s < %d KB/s), not counting\n",
-                           bytes_per_sec / 1000, MIN_STREAMING_RATE / 1000);
-                    free_flow(f);
-                    continue;
-                }
-
-                /* Update client quota */
-                uint32_t client_ip = is_lan_ip(f->src_ip) ? f->src_ip : f->dst_ip;
-                int idx = get_client_index(client_ip);
-                clients[idx].ip = client_ip;
-                clients[idx].streaming_seconds += duration_sec;
-                clients[idx].in_use = 1;
-
-                /* Set today's date if not set */
-                if (clients[idx].last_reset_date[0] == '\0') {
-                    get_current_date(clients[idx].last_reset_date,
-                                     sizeof(clients[idx].last_reset_date));
-                }
-
-                char client_str[INET_ADDRSTRLEN];
-                struct in_addr client_addr = { .s_addr = client_ip };
-                inet_ntop(AF_INET, &client_addr, client_str, sizeof(client_str));
-
-                double pct = (100.0 * clients[idx].streaming_seconds) / daily_quota;
-                printf("[QUOTA] %s | total: %lu/%lu seconds (%.1f min, %.0f%%)\n",
-                       client_str, clients[idx].streaming_seconds, daily_quota,
-                       clients[idx].streaming_seconds / 60.0, pct);
-
-                /* Check if quota exceeded */
-                if (clients[idx].streaming_seconds >= daily_quota) {
-                    block_client(client_ip);
-                }
             }
-
+            /* Note: Quota is now tracked via session-based timing, not flow duration */
             free_flow(f);
+        }
+    }
+}
+
+/* Check for streaming session timeouts */
+static void check_session_timeouts(void) {
+    uint64_t now_ms = get_time_ms();
+
+    for (int i = 0; i < 256; i++) {
+        if (!clients[i].in_use || clients[i].session_start_ms == 0)
+            continue;
+
+        if ((now_ms - clients[i].last_streaming_activity_ms) > SESSION_TIMEOUT) {
+            /* Session ended due to inactivity */
+            uint64_t duration_sec =
+                (clients[i].last_streaming_activity_ms - clients[i].session_start_ms) / 1000;
+            clients[i].streaming_seconds += duration_sec;
+
+            double pct = (100.0 * clients[i].streaming_seconds) / daily_quota;
+            printf("[SESSION_END] %s | +%lu sec | total: %lu/%lu sec (%.1f min, %.0f%%)\n",
+                   ip_to_str(clients[i].ip), duration_sec, clients[i].streaming_seconds, daily_quota,
+                   clients[i].streaming_seconds / 60.0, pct);
+
+            clients[i].session_start_ms = 0;  /* Reset session */
+
+            /* Check if quota exceeded */
+            if (clients[i].streaming_seconds >= daily_quota) {
+                block_client(clients[i].ip);
+            }
         }
     }
 }
@@ -506,31 +498,89 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
             NULL  /* input_info - nDPI 5.0 */
         );
 
-        /* Check if detection is done */
-        if (flow->detected_protocol.proto.app_protocol != NDPI_PROTOCOL_UNKNOWN ||
-            flow->packets > 10) {
+        /* Check if detection is done
+         * For QUIC: master_protocol is detected early, but we need more packets
+         * to decrypt the Initial and get SNI for the app_protocol (YouTube, etc.)
+         */
+        uint16_t master = flow->detected_protocol.proto.master_protocol;
+        uint16_t app = flow->detected_protocol.proto.app_protocol;
 
-            if (flow->detected_protocol.proto.app_protocol == NDPI_PROTOCOL_UNKNOWN) {
+        /* QUIC needs more packets for sub-classification */
+        int is_quic = (master == NDPI_PROTOCOL_QUIC || app == NDPI_PROTOCOL_QUIC);
+        uint32_t max_packets = is_quic ? 32 : 10;  /* More packets for QUIC */
+
+        /* Detection complete when:
+         * - App protocol identified (not just master), OR
+         * - Max packets reached
+         */
+        int detection_done = (app != NDPI_PROTOCOL_UNKNOWN && app != NDPI_PROTOCOL_QUIC) ||
+                             flow->packets > max_packets;
+
+        if (detection_done) {
+            if (app == NDPI_PROTOCOL_UNKNOWN || app == NDPI_PROTOCOL_QUIC) {
                 flow->detected_protocol = ndpi_detection_giveup(
                     ndpi_module, flow->ndpi_flow);  /* nDPI 5.0: only 2 params */
             }
             flow->detection_completed = 1;
 
+            /* Log detected protocol for debugging */
+            char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
+            struct in_addr src_addr = { .s_addr = src_ip };
+            struct in_addr dst_addr = { .s_addr = dst_ip };
+            inet_ntop(AF_INET, &src_addr, src_str, sizeof(src_str));
+            inet_ntop(AF_INET, &dst_addr, dst_str, sizeof(dst_str));
+
+            char proto_name[64];
+            ndpi_protocol2name(ndpi_module, flow->detected_protocol.proto, proto_name, sizeof(proto_name));
+
+            const char *cat_name = ndpi_category_get_name(ndpi_module, flow->detected_protocol.category);
+            const char *proto_transport = (protocol == IPPROTO_UDP) ? "UDP" : "TCP";
+
+            /* Get host info from nDPI flow */
+            const char *host = (flow->ndpi_flow && flow->ndpi_flow->host_server_name[0])
+                               ? (const char *)flow->ndpi_flow->host_server_name : "(none)";
+
             /* Log new streaming flow */
             if (is_streaming_category(flow->detected_protocol)) {
-                char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
-                struct in_addr src_addr = { .s_addr = src_ip };
-                struct in_addr dst_addr = { .s_addr = dst_ip };
-                inet_ntop(AF_INET, &src_addr, src_str, sizeof(src_str));
-                inet_ntop(AF_INET, &dst_addr, dst_str, sizeof(dst_str));
+                printf("[STREAMING] %s (%s/%s) | %s:%d -> %s:%d | host=%s\n",
+                       proto_name, proto_transport, cat_name, src_str, ntohs(src_port),
+                       dst_str, ntohs(dst_port), host);
 
-                char proto_name[64];
-                ndpi_protocol2name(ndpi_module, flow->detected_protocol.proto, proto_name, sizeof(proto_name));
+                /* Update session tracking for this client */
+                uint32_t client_ip = is_lan_ip(src_ip) ? src_ip : dst_ip;
+                int idx = get_client_index(client_ip);
+                uint64_t now_ms = get_time_ms();
 
-                printf("[STREAMING] %s | %s:%d -> %s:%d\n",
-                       proto_name, src_str, ntohs(src_port),
-                       dst_str, ntohs(dst_port));
+                clients[idx].ip = client_ip;
+                clients[idx].in_use = 1;
+
+                if (clients[idx].session_start_ms == 0) {
+                    /* New streaming session starting */
+                    clients[idx].session_start_ms = now_ms;
+                    printf("[SESSION_START] %s\n", ip_to_str(client_ip));
+
+                    /* Set today's date if not set */
+                    if (clients[idx].last_reset_date[0] == '\0') {
+                        get_current_date(clients[idx].last_reset_date,
+                                         sizeof(clients[idx].last_reset_date));
+                    }
+                }
+                clients[idx].last_streaming_activity_ms = now_ms;
+            } else if (debug_mode && flow->detected_protocol.proto.app_protocol != NDPI_PROTOCOL_UNKNOWN) {
+                /* Debug: log non-streaming detected protocols */
+                printf("[DEBUG] %s (%s/%s) | %s:%d -> %s:%d | host=%s\n",
+                       proto_name, proto_transport, cat_name, src_str, ntohs(src_port),
+                       dst_str, ntohs(dst_port), host);
             }
+        }
+    }
+
+    /* Update session activity for ongoing streaming flows */
+    if (flow->detection_completed && is_streaming_category(flow->detected_protocol)) {
+        uint32_t client_ip = is_lan_ip(flow->src_ip) ? flow->src_ip : flow->dst_ip;
+        int idx = get_client_index(client_ip);
+        if (clients[idx].session_start_ms != 0) {
+            clients[idx].last_streaming_activity_ms = get_time_ms();
         }
     }
 }
@@ -543,15 +593,17 @@ static void signal_handler(int sig) {
 
 /* Print usage */
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s -i <interface> [options]\n", prog);
-    fprintf(stderr, "\nRequired:\n");
-    fprintf(stderr, "  -i <iface>   Network interface (e.g., eth0, br-lan)\n");
+    fprintf(stderr, "Usage: %s [-i <interface> | -r <pcap_file>] [options]\n", prog);
+    fprintf(stderr, "\nInput (one required):\n");
+    fprintf(stderr, "  -i <iface>   Live capture from network interface (e.g., eth0, br-lan)\n");
+    fprintf(stderr, "  -r <file>    Read from pcap file (use '-' for stdin)\n");
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -s <subnet>  LAN subnet (default: %s)\n", LAN_SUBNET);
     fprintf(stderr, "  -m <mask>    LAN netmask (default: %s)\n", LAN_MASK);
     fprintf(stderr, "  -q <secs>    Daily quota in seconds (default: 3600)\n");
-    fprintf(stderr, "  -f <file>    State file path (default: %s)\n", STATE_FILE);
+    fprintf(stderr, "  -f <file>    Enable state persistence to file (disabled by default)\n");
     fprintf(stderr, "  -e           Enable enforcement mode (add blocked IPs to nftables)\n");
+    fprintf(stderr, "  -d           Enable debug mode (verbose protocol logging)\n");
     fprintf(stderr, "  -h           Show this help\n");
     fprintf(stderr, "\nWithout -e, runs in dry-run mode (logs only, no blocking).\n");
     exit(1);
@@ -564,20 +616,26 @@ int main(int argc, char *argv[]) {
     char errbuf[PCAP_ERRBUF_SIZE];
     int opt;
 
-    while ((opt = getopt(argc, argv, "i:s:m:q:f:eh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:r:s:m:q:f:edh")) != -1) {
         switch (opt) {
             case 'i': interface = optarg; break;
+            case 'r': input_pcap = optarg; break;
             case 's': subnet = optarg; break;
             case 'm': mask = optarg; break;
             case 'q': daily_quota = (uint64_t)atol(optarg); break;
             case 'f': state_file_path = optarg; break;
             case 'e': enforce_mode = 1; break;
+            case 'd': debug_mode = 1; break;
             case 'h':
             default: usage(argv[0]);
         }
     }
 
-    if (!interface) usage(argv[0]);
+    if (!interface && !input_pcap) usage(argv[0]);
+    if (interface && input_pcap) {
+        fprintf(stderr, "Error: Cannot use both -i and -r\n");
+        usage(argv[0]);
+    }
 
     /* Parse LAN network */
     inet_pton(AF_INET, subnet, &lan_network);
@@ -585,9 +643,16 @@ int main(int argc, char *argv[]) {
     lan_network &= lan_netmask;
 
     printf("StreamGuard - Video Streaming Quota Enforcement\n");
-    printf("Interface: %s | LAN: %s/%s | Quota: %lu sec | Mode: %s\n\n",
-           interface, subnet, mask, daily_quota,
-           enforce_mode ? "ENFORCE" : "DRY-RUN");
+    if (input_pcap) {
+        printf("Input: %s | LAN: %s/%s | Quota: %lu sec | Mode: %s\n\n",
+               strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap,
+               subnet, mask, daily_quota,
+               enforce_mode ? "ENFORCE" : "DRY-RUN");
+    } else {
+        printf("Interface: %s | LAN: %s/%s | Quota: %lu sec | Mode: %s\n\n",
+               interface, subnet, mask, daily_quota,
+               enforce_mode ? "ENFORCE" : "DRY-RUN");
+    }
 
     /* Initialize nDPI (5.0 API - all protocols enabled by default) */
     ndpi_module = ndpi_init_detection_module(NULL);
@@ -604,21 +669,31 @@ int main(int argc, char *argv[]) {
     load_state();
     check_daily_reset();
 
-    /* Open pcap */
-    pcap_handle = pcap_open_live(interface, 1600, 1, 100, errbuf);
-    if (!pcap_handle) {
-        fprintf(stderr, "pcap_open_live failed: %s\n", errbuf);
-        return 1;
-    }
+    /* Open pcap - either from file or live interface */
+    if (input_pcap) {
+        pcap_handle = pcap_open_offline(input_pcap, errbuf);
+        if (!pcap_handle) {
+            fprintf(stderr, "pcap_open_offline failed: %s\n", errbuf);
+            return 1;
+        }
+        printf("Reading from %s...\n\n",
+               strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap);
+    } else {
+        pcap_handle = pcap_open_live(interface, 1600, 1, 100, errbuf);
+        if (!pcap_handle) {
+            fprintf(stderr, "pcap_open_live failed: %s\n", errbuf);
+            return 1;
+        }
 
-    /* Set filter for HTTP/HTTPS/QUIC */
-    struct bpf_program fp;
-    if (pcap_compile(pcap_handle, &fp, "port 80 or port 443", 1, PCAP_NETMASK_UNKNOWN) == 0) {
-        pcap_setfilter(pcap_handle, &fp);
-        pcap_freecode(&fp);
-    }
+        /* Set filter for HTTP/HTTPS/QUIC (only for live capture) */
+        struct bpf_program fp;
+        if (pcap_compile(pcap_handle, &fp, "port 80 or port 443", 1, PCAP_NETMASK_UNKNOWN) == 0) {
+            pcap_setfilter(pcap_handle, &fp);
+            pcap_freecode(&fp);
+        }
 
-    printf("Capturing on %s... Press Ctrl+C to stop\n\n", interface);
+        printf("Capturing on %s... Press Ctrl+C to stop\n\n", interface);
+    }
 
     /* Setup signal handlers */
     signal(SIGINT, signal_handler);
@@ -642,6 +717,7 @@ int main(int argc, char *argv[]) {
         time_t now = time(NULL);
         if (now - last_expire >= 5) {
             expire_flows();
+            check_session_timeouts();
             check_daily_reset();
             last_expire = now;
 
@@ -654,14 +730,28 @@ int main(int argc, char *argv[]) {
 
     printf("\nShutting down...\n");
 
+    /* End any active streaming sessions */
+    uint64_t now_ms = get_time_ms();
+    for (int i = 0; i < 256; i++) {
+        if (clients[i].in_use && clients[i].session_start_ms != 0) {
+            /* Session was active - count time up to now */
+            uint64_t duration_sec =
+                (now_ms - clients[i].session_start_ms) / 1000;
+            clients[i].streaming_seconds += duration_sec;
+
+            printf("[SESSION_END] %s | +%lu sec (shutdown) | total: %lu sec\n",
+                   ip_to_str(clients[i].ip), duration_sec, clients[i].streaming_seconds);
+
+            clients[i].session_start_ms = 0;
+        }
+    }
+
     /* Save final state */
     save_state();
 
-    /* Final expiration to log remaining flows */
-    uint64_t now_ms = get_time_ms();
+    /* Final expiration to log remaining flows (debug mode only) */
     for (int i = 0; i < MAX_FLOWS; i++) {
         if (flows[i].in_use) {
-            /* Set to current time (not 0!) to get correct duration */
             flows[i].last_seen_ms = now_ms - (FLOW_IDLE_TIMEOUT * 1000) - 1;
         }
     }
@@ -671,11 +761,8 @@ int main(int argc, char *argv[]) {
     printf("\n=== Final Quota Summary ===\n");
     for (int i = 0; i < 256; i++) {
         if (clients[i].in_use) {
-            char ip_str[INET_ADDRSTRLEN];
-            struct in_addr addr = { .s_addr = clients[i].ip };
-            inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
             printf("%s: %lu seconds (%.1f minutes)\n",
-                   ip_str, clients[i].streaming_seconds,
+                   ip_to_str(clients[i].ip), clients[i].streaming_seconds,
                    clients[i].streaming_seconds / 60.0);
         }
     }
