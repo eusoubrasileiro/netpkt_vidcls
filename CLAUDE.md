@@ -91,6 +91,21 @@ make
 sudo ./streamguard -i eno1
 ```
 
+### Run via tcpdump pipe
+```bash
+sudo tcpdump -i eno1 -w - | ./streamguard -r -
+```
+
+### Capture and save pcap for later testing
+```bash
+sudo tcpdump -i eno1 -w - | tee streaming_sample.pcap | ./streamguard -r -
+```
+
+### Replay saved pcap
+```bash
+./streamguard -r streaming_sample.pcap
+```
+
 ### Run (enforcement mode - blocks when quota exceeded)
 ```bash
 sudo ./streamguard -i eno1 -e -q 3600
@@ -116,9 +131,11 @@ ssh root@192.168.0.1 "nft delete element inet fw4 blocked_streaming_clients '{ 1
 
 ```
 Usage: streamguard -i <interface> [options]
+   or: streamguard -r <pcap_file> [options]
 
-Required:
-  -i <iface>   Network interface (e.g., eno1, eth0)
+Input (one required):
+  -i <iface>   Capture live from network interface (e.g., eno1, eth0)
+  -r <file>    Read from pcap file (use '-' for stdin pipe from tcpdump)
 
 Options:
   -s <subnet>  LAN subnet (default: 192.168.0.0)
@@ -126,6 +143,7 @@ Options:
   -q <secs>    Daily quota in seconds (default: 3600)
   -f <file>    State file path (default: streamguard_state.json)
   -e           Enable enforcement mode (blocks via nftables)
+  -d           Debug mode (verbose output)
   -h           Show help
 
 Without -e, runs in dry-run mode (logs only, no blocking).

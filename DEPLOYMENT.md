@@ -132,6 +132,17 @@ cd /path/to/streamguard/src
 sudo ./streamguard -i eno1
 ```
 
+**Alternative: Using tcpdump pipe**
+```bash
+sudo tcpdump -i eno1 -w - | ./streamguard -r -
+```
+
+**Capture and save pcap for later testing**
+```bash
+sudo tcpdump -i eno1 -w - | tee youtube_sample.pcap | ./streamguard -r -
+# Later replay with: ./streamguard -r youtube_sample.pcap
+```
+
 Now watch YouTube on a phone/tablet on your network. You should see:
 
 ```
