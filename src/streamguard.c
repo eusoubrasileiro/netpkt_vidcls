@@ -84,17 +84,36 @@ static uint32_t lan_network;
 static uint32_t lan_netmask;
 static int enforce_mode = 0;  /* 0=dry-run, 1=enforce */
 static int debug_mode = 0;   /* 0=normal, 1=verbose debug output */
+static int video_only_mode = 0;  /* 0=all social media, 1=video streaming only */
 static uint64_t daily_quota = 3600;  /* seconds */
 static time_t last_state_save = 0;
 static char *state_file_path = NULL;
 static char *input_pcap = NULL;  /* Read from file instead of live capture */
 
-/* Check if protocol is in a streaming category (VIDEO, STREAMING, or MEDIA) */
-static int is_streaming_category(ndpi_protocol proto) {
-    /* nDPI 5.0: category is directly in ndpi_protocol struct */
-    return (proto.category == NDPI_PROTOCOL_CATEGORY_VIDEO ||
-            proto.category == NDPI_PROTOCOL_CATEGORY_STREAMING ||
-            proto.category == NDPI_PROTOCOL_CATEGORY_MEDIA);
+/* Check if protocol is a social media platform (Instagram, Facebook) */
+static int is_social_media_protocol(ndpi_protocol proto) {
+    uint16_t app = proto.proto.app_protocol;
+    return (app == NDPI_PROTOCOL_INSTAGRAM ||
+            app == NDPI_PROTOCOL_FACEBOOK ||
+            app == NDPI_PROTOCOL_FACEBOOK_REEL_STORY);
+}
+
+/* Check if traffic should be tracked for quota
+ * Default: VIDEO/STREAMING/MEDIA categories + social media (Instagram, Facebook)
+ * Video-only mode (-V): Only VIDEO/STREAMING/MEDIA categories
+ */
+static int is_trackable_traffic(ndpi_protocol proto) {
+    /* Always track pure video/streaming categories */
+    if (proto.category == NDPI_PROTOCOL_CATEGORY_VIDEO ||
+        proto.category == NDPI_PROTOCOL_CATEGORY_STREAMING ||
+        proto.category == NDPI_PROTOCOL_CATEGORY_MEDIA) {
+        return 1;
+    }
+    /* Track social media unless in video-only mode */
+    if (!video_only_mode && is_social_media_protocol(proto)) {
+        return 1;
+    }
+    return 0;
 }
 
 /* Check if IP is in LAN */
@@ -388,7 +407,7 @@ static void expire_flows(void) {
 
         if ((now_ms - f->last_seen_ms) > (FLOW_IDLE_TIMEOUT * 1000)) {
             /* Flow expired - log if debug mode and streaming category */
-            if (debug_mode && f->detection_completed && is_streaming_category(f->detected_protocol)) {
+            if (debug_mode && f->detection_completed && is_trackable_traffic(f->detected_protocol)) {
                 char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
                 struct in_addr src_addr = { .s_addr = f->src_ip };
                 struct in_addr dst_addr = { .s_addr = f->dst_ip };
@@ -541,7 +560,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
                                ? (const char *)flow->ndpi_flow->host_server_name : "(none)";
 
             /* Log new streaming flow */
-            if (is_streaming_category(flow->detected_protocol)) {
+            if (is_trackable_traffic(flow->detected_protocol)) {
                 printf("[STREAMING] %s (%s/%s) | %s:%d -> %s:%d | host=%s\n",
                        proto_name, proto_transport, cat_name, src_str, ntohs(src_port),
                        dst_str, ntohs(dst_port), host);
@@ -576,7 +595,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
     }
 
     /* Update session activity for ongoing streaming flows */
-    if (flow->detection_completed && is_streaming_category(flow->detected_protocol)) {
+    if (flow->detection_completed && is_trackable_traffic(flow->detected_protocol)) {
         uint32_t client_ip = is_lan_ip(flow->src_ip) ? flow->src_ip : flow->dst_ip;
         int idx = get_client_index(client_ip);
         if (clients[idx].session_start_ms != 0) {
@@ -603,9 +622,12 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -q <secs>    Daily quota in seconds (default: 3600)\n");
     fprintf(stderr, "  -f <file>    Enable state persistence to file (disabled by default)\n");
     fprintf(stderr, "  -e           Enable enforcement mode (add blocked IPs to nftables)\n");
+    fprintf(stderr, "  -V           Video-only mode (ignore social media browsing)\n");
     fprintf(stderr, "  -d           Enable debug mode (verbose protocol logging)\n");
     fprintf(stderr, "  -h           Show this help\n");
-    fprintf(stderr, "\nWithout -e, runs in dry-run mode (logs only, no blocking).\n");
+    fprintf(stderr, "\nDefault: tracks all social media (Instagram, Facebook) + video streaming.\n");
+    fprintf(stderr, "With -V: only tracks pure video streaming (YouTube, Netflix, TikTok).\n");
+    fprintf(stderr, "Without -e, runs in dry-run mode (logs only, no blocking).\n");
     exit(1);
 }
 
@@ -616,7 +638,7 @@ int main(int argc, char *argv[]) {
     char errbuf[PCAP_ERRBUF_SIZE];
     int opt;
 
-    while ((opt = getopt(argc, argv, "i:r:s:m:q:f:edh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:r:s:m:q:f:eVdh")) != -1) {
         switch (opt) {
             case 'i': interface = optarg; break;
             case 'r': input_pcap = optarg; break;
@@ -625,6 +647,7 @@ int main(int argc, char *argv[]) {
             case 'q': daily_quota = (uint64_t)atol(optarg); break;
             case 'f': state_file_path = optarg; break;
             case 'e': enforce_mode = 1; break;
+            case 'V': video_only_mode = 1; break;
             case 'd': debug_mode = 1; break;
             case 'h':
             default: usage(argv[0]);
@@ -643,14 +666,17 @@ int main(int argc, char *argv[]) {
     lan_network &= lan_netmask;
 
     printf("StreamGuard - Video Streaming Quota Enforcement\n");
+    const char *tracking_mode = video_only_mode ? "VIDEO-ONLY" : "ALL-SOCIAL";
     if (input_pcap) {
-        printf("Input: %s | LAN: %s/%s | Quota: %lu sec | Mode: %s\n\n",
+        printf("Input: %s | LAN: %s/%s | Quota: %lu sec | %s | %s\n\n",
                strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap,
                subnet, mask, daily_quota,
+               tracking_mode,
                enforce_mode ? "ENFORCE" : "DRY-RUN");
     } else {
-        printf("Interface: %s | LAN: %s/%s | Quota: %lu sec | Mode: %s\n\n",
+        printf("Interface: %s | LAN: %s/%s | Quota: %lu sec | %s | %s\n\n",
                interface, subnet, mask, daily_quota,
+               tracking_mode,
                enforce_mode ? "ENFORCE" : "DRY-RUN");
     }
 

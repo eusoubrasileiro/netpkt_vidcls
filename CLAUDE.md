@@ -27,8 +27,8 @@ Ubuntu Machine (StreamGuard)              OpenWrt Router
 
 **How it works:**
 1. StreamGuard captures packets on Ubuntu machine
-2. nDPI detects protocol and determines its category (VIDEO, STREAMING, MEDIA)
-3. Only flows with throughput >100KB/s are counted (filters out static pages)
+2. nDPI detects protocol - matches VIDEO/STREAMING/MEDIA categories + social media (Instagram, Facebook)
+3. Session-based time tracking with 45s inactivity timeout
 4. Per-client watch time accumulated, saved to JSON
 5. When quota exceeded, client IP added to router's nftables blocked set
 6. Router drops traffic from blocked clients to streaming destinations
@@ -36,36 +36,49 @@ Ubuntu Machine (StreamGuard)              OpenWrt Router
 
 ## Detection Approach
 
+### Two Tracking Modes
+
+StreamGuard supports two tracking modes:
+
+| Mode | Flag | Tracks |
+|------|------|--------|
+| **ALL-SOCIAL** (default) | none | Video streaming + all Instagram/Facebook activity |
+| **VIDEO-ONLY** | `-V` | Only pure video streaming (YouTube, Netflix, TikTok) |
+
 ### Category-Based Detection
 
-Rather than hardcoding individual protocols (YouTube, Netflix, etc.), StreamGuard uses nDPI's **protocol categories**:
+Pure video services are detected via nDPI protocol categories:
 
 ```c
-/* nDPI 5.0: category is directly in ndpi_protocol struct */
-return (proto.category == NDPI_PROTOCOL_CATEGORY_VIDEO ||
-        proto.category == NDPI_PROTOCOL_CATEGORY_STREAMING ||
-        proto.category == NDPI_PROTOCOL_CATEGORY_MEDIA);
-```
-
-**Benefits:**
-- Future-proof: New services auto-detected by category
-- No hardcoded protocol list to maintain
-- Works even when nDPI doesn't have specific service detection
-
-### Throughput Filtering
-
-To avoid counting static pages (Facebook developer docs, YouTube homepage, etc.) as streaming:
-
-```c
-#define MIN_STREAMING_RATE 100000  /* 100KB/s minimum */
-
-uint64_t bytes_per_sec = (f->bytes * 1000) / duration_ms;
-if (bytes_per_sec < MIN_STREAMING_RATE) {
-    /* Skip - not actual video playback */
+/* VIDEO/STREAMING/MEDIA categories - always tracked */
+if (proto.category == NDPI_PROTOCOL_CATEGORY_VIDEO ||
+    proto.category == NDPI_PROTOCOL_CATEGORY_STREAMING ||
+    proto.category == NDPI_PROTOCOL_CATEGORY_MEDIA) {
+    return 1;
 }
 ```
 
-A 720p video uses ~2-5 Mbps (250-625 KB/s). 100KB/s is a conservative threshold.
+### Social Media Detection
+
+Instagram and Facebook are classified as `SOCIAL_NETWORK` in nDPI (not VIDEO), so they require explicit protocol detection:
+
+```c
+/* Track social media unless in video-only mode */
+static int is_social_media_protocol(ndpi_protocol proto) {
+    uint16_t app = proto.proto.app_protocol;
+    return (app == NDPI_PROTOCOL_INSTAGRAM ||
+            app == NDPI_PROTOCOL_FACEBOOK ||
+            app == NDPI_PROTOCOL_FACEBOOK_REEL_STORY);
+}
+```
+
+### Session-Based Timing
+
+Time is tracked per-session with a 45-second inactivity timeout:
+- Session starts when first tracked packet arrives
+- Each packet resets the inactivity timer
+- Session ends after 45s of no packets (handles idle browser tabs)
+- Duration = (last_activity - session_start)
 
 ## Key Files
 
@@ -143,25 +156,31 @@ Options:
   -q <secs>    Daily quota in seconds (default: 3600)
   -f <file>    State file path (default: streamguard_state.json)
   -e           Enable enforcement mode (blocks via nftables)
+  -V           Video-only mode (ignore social media browsing)
   -d           Debug mode (verbose output)
   -h           Show help
 
+Default: tracks all social media (Instagram, Facebook) + video streaming.
+With -V: only tracks pure video streaming (YouTube, Netflix, TikTok).
 Without -e, runs in dry-run mode (logs only, no blocking).
 ```
 
-## Detected Categories
+## What Gets Tracked
 
-StreamGuard detects traffic in these nDPI categories:
+### Always Tracked (VIDEO/STREAMING/MEDIA categories)
+- YouTube, Netflix, TikTok, Disney+, etc.
+- Live streaming services (Twitch, etc.)
+- General media content
 
-- **NDPI_PROTOCOL_CATEGORY_VIDEO** - YouTube, Netflix, TikTok, etc.
-- **NDPI_PROTOCOL_CATEGORY_STREAMING** - Live streaming services
-- **NDPI_PROTOCOL_CATEGORY_MEDIA** - General media content
+### Tracked in Default Mode (social media protocols)
+- **Instagram** - Reels, Stories, browsing, video
+- **Facebook** - Reels, Stories, video, browsing
+- **Facebook Messenger** video calls (if detected)
 
-Social media with video (Instagram, Facebook) is also detected when actively streaming video content.
-
-**Not Tracked (by design):**
-- Audio-only services (Spotify, Apple Music) - different category
-- Low-throughput browsing (<100KB/s) on video sites
+### Not Tracked
+- Audio-only services (Spotify, Apple Music) - `MUSIC` category
+- Other social networks (Twitter/X, Snapchat) - not yet added
+- Non-media web browsing
 
 ## Configuration
 
@@ -220,10 +239,13 @@ The Makefile automatically uses the local `nDPI/` build if present.
 ## Log Output
 
 ```
+StreamGuard - Video Streaming Quota Enforcement
+Interface: eno1 | LAN: 192.168.0.0/255.255.255.0 | Quota: 3600 sec | ALL-SOCIAL | DRY-RUN
+
 [STREAMING] QUIC.YouTube | 192.168.0.10:54321 -> 142.250.1.1:443
-[FLOW_END] QUIC.YouTube | 192.168.0.10:54321 -> 142.250.1.1:443 | 5.2 MB | 45 sec | 118 KB/s
-[QUOTA] 192.168.0.10 | total: 2845/3600 seconds (47.4 min, 79%)
-[SKIP] Low throughput flow (12 KB/s < 100 KB/s), not counting
+[STREAMING] TLS.Instagram | 192.168.0.10:54322 -> 157.240.1.1:443
+[SESSION_START] 192.168.0.10
+[SESSION_END] 192.168.0.10 | +120 sec | total: 2845/3600 sec (47.4 min, 79%)
 [BLOCKED] 192.168.0.10 (quota exceeded: 3612/3600 seconds)
 [RESET] 192.168.0.10: 3612 seconds -> 0 (new day: 2026-01-06)
 ```
@@ -232,9 +254,7 @@ The Makefile automatically uses the local `nDPI/` build if present.
 
 1. **nDPI 4.2.0 (Ubuntu package)** - Does not detect modern QUIC/YouTube. Must build nDPI 5.0 from source with `--with-local-libgcrypt`.
 
-2. **Flow duration at shutdown** - Fixed. Previously showed 40+ year durations due to timestamp underflow.
-
-3. **False positives on static pages** - Fixed. Throughput filtering now excludes low-bandwidth flows.
+2. **Twitter/X, Snapchat not tracked** - Only Instagram/Facebook social media currently implemented. Can be added if needed.
 
 ## nDPI 5.0 API Notes
 
