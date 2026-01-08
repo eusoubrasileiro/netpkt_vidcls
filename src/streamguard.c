@@ -131,7 +131,7 @@ static const char *ip_to_str(uint32_t ip) {
 
 /* Get client index from IP (assumes /24) */
 static int get_client_index(uint32_t ip) {
-    return ip & 0xFF;
+    return ntohl(ip) & 0xFF;  /* Extract last octet in host byte order */
 }
 
 /* Get current date as YYYY-MM-DD string */
