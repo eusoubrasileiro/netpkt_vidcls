@@ -27,6 +27,13 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+/* For unit testing: expose internal functions when compiled with -DTESTING */
+#ifdef TESTING
+#define STATIC  /* empty - expose functions for testing */
+#else
+#define STATIC static
+#endif
+
 #define MAX_FLOWS 65536
 #define SAVE_INTERVAL 60  /* seconds */
 #define FLOW_IDLE_TIMEOUT 30  /* seconds */
@@ -100,7 +107,7 @@ static uint64_t get_current_time_ms(void) {
 }
 
 /* Check if protocol is a social media platform (Instagram, Facebook) */
-static int is_social_media_protocol(ndpi_protocol proto) {
+STATIC int is_social_media_protocol(ndpi_protocol proto) {
     uint16_t app = proto.proto.app_protocol;
     return (app == NDPI_PROTOCOL_INSTAGRAM ||
             app == NDPI_PROTOCOL_FACEBOOK ||
@@ -111,7 +118,7 @@ static int is_social_media_protocol(ndpi_protocol proto) {
  * Default: VIDEO/STREAMING/MEDIA categories + social media (Instagram, Facebook)
  * Video-only mode (-V): Only VIDEO/STREAMING/MEDIA categories
  */
-static int is_trackable_traffic(ndpi_protocol proto) {
+STATIC int is_trackable_traffic(ndpi_protocol proto) {
     /* Always track pure video/streaming categories */
     if (proto.category == NDPI_PROTOCOL_CATEGORY_VIDEO ||
         proto.category == NDPI_PROTOCOL_CATEGORY_STREAMING ||
@@ -126,7 +133,7 @@ static int is_trackable_traffic(ndpi_protocol proto) {
 }
 
 /* Check if IP is in LAN */
-static int is_lan_ip(uint32_t ip) {
+STATIC int is_lan_ip(uint32_t ip) {
     return (ip & lan_netmask) == lan_network;
 }
 
@@ -139,7 +146,7 @@ static const char *ip_to_str(uint32_t ip) {
 }
 
 /* Get client index from IP (assumes /24) */
-static int get_client_index(uint32_t ip) {
+STATIC int get_client_index(uint32_t ip) {
     return ntohl(ip) & 0xFF;  /* Extract last octet in host byte order */
 }
 
@@ -199,7 +206,7 @@ static void unblock_client(uint32_t client_ip) {
 }
 
 /* Save state to JSON file (only if -f specified) */
-static void save_state(void) {
+STATIC void save_state(void) {
     if (!state_file_path) return;  /* State persistence disabled */
 
     cJSON *root = cJSON_CreateObject();
@@ -233,7 +240,7 @@ static void save_state(void) {
 }
 
 /* Load state from JSON file (only if -f specified) */
-static void load_state(void) {
+STATIC void load_state(void) {
     if (!state_file_path) return;  /* State persistence disabled */
 
     FILE *f = fopen(state_file_path, "r");
@@ -331,7 +338,7 @@ static void check_daily_reset(void) {
 }
 
 /* Normalize flow key - smaller IP first for consistent hashing */
-static void normalize_flow_key(uint32_t *ip1, uint32_t *ip2,
+STATIC void normalize_flow_key(uint32_t *ip1, uint32_t *ip2,
                                 uint16_t *port1, uint16_t *port2) {
     if (*ip1 > *ip2 || (*ip1 == *ip2 && *port1 > *port2)) {
         uint32_t tmp_ip = *ip1; *ip1 = *ip2; *ip2 = tmp_ip;
@@ -340,7 +347,7 @@ static void normalize_flow_key(uint32_t *ip1, uint32_t *ip2,
 }
 
 /* Simple hash for flow lookup */
-static uint32_t flow_hash(uint32_t src_ip, uint32_t dst_ip,
+STATIC uint32_t flow_hash(uint32_t src_ip, uint32_t dst_ip,
                           uint16_t src_port, uint16_t dst_port,
                           uint8_t protocol) {
     /* Normalize so both directions hash the same */
@@ -642,6 +649,49 @@ static void usage(const char *prog) {
     fprintf(stderr, "Without -e, runs in dry-run mode (logs only, no blocking).\n");
     exit(1);
 }
+
+/* Test helper functions - only compiled when TESTING is defined */
+#ifdef TESTING
+void test_set_lan_network(uint32_t network, uint32_t netmask) {
+    lan_network = network;
+    lan_netmask = netmask;
+}
+
+void test_set_video_only_mode(int mode) {
+    video_only_mode = mode;
+}
+
+void test_set_state_file_path(const char *path) {
+    state_file_path = (char *)path;
+}
+
+void test_init_client(int idx, uint32_t ip, uint64_t seconds, const char *date) {
+    if (idx < 0 || idx >= 256) return;
+    clients[idx].ip = ip;
+    clients[idx].streaming_seconds = seconds;
+    clients[idx].in_use = 1;
+    clients[idx].is_blocked = 0;
+    if (date) {
+        snprintf(clients[idx].last_reset_date, sizeof(clients[idx].last_reset_date), "%s", date);
+    }
+}
+
+void test_get_client(int idx, uint32_t *ip, uint64_t *seconds, int *blocked) {
+    if (idx < 0 || idx >= 256) return;
+    if (ip) *ip = clients[idx].ip;
+    if (seconds) *seconds = clients[idx].streaming_seconds;
+    if (blocked) *blocked = clients[idx].is_blocked;
+}
+
+int test_client_in_use(int idx) {
+    if (idx < 0 || idx >= 256) return 0;
+    return clients[idx].in_use;
+}
+
+void test_clear_clients(void) {
+    memset(clients, 0, sizeof(clients));
+}
+#endif
 
 int main(int argc, char *argv[]) {
     char *interface = NULL;

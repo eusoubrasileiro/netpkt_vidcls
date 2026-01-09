@@ -1,5 +1,5 @@
 #!/bin/bash
-# test/run_tests.sh - StreamGuard pcap-based unit tests
+# test/integration/run_tests.sh - StreamGuard pcap-based integration tests
 #
 # Test pcaps:
 #   youtube_45sec.pcap    - YouTube video from PC (192.168.0.25)
@@ -7,7 +7,7 @@
 #   multi_client.pcap     - Multiple clients via router
 #   browsing_30sec.pcap   - Non-streaming web browsing (negative test)
 
-STREAMGUARD="../src/streamguard"
+STREAMGUARD="../../src/streamguard"
 PASS=0; FAIL=0
 
 test() {
@@ -78,6 +78,74 @@ test "Multi-client tracking"        multi_client.pcap     "SESSION_START"
 
 # --- browsing_30sec.pcap (negative test) ---
 test "Browsing not tracked"         browsing_30sec.pcap   "STREAMING" "" "no"
+
+# --- Quota enforcement tests ---
+# Note: Blocking only triggers on session timeout (45s inactivity), not at shutdown.
+# These tests verify quota accumulation exceeds/stays under the limit.
+test_quota_exceeded() {
+    local name="$1" pcap="$2" quota="$3"
+    printf "%-45s" "$name..."
+
+    if [ ! -f "pcaps/$pcap" ]; then
+        echo "SKIP (pcap not found)"
+        return
+    fi
+
+    out=$($STREAMGUARD -r "pcaps/$pcap" -q "$quota" 2>&1)
+    # Extract final quota from "total: NN sec"
+    secs=$(echo "$out" | grep -oE "total: [0-9]+ sec" | tail -1 | grep -oE "[0-9]+")
+
+    if [ -z "$secs" ]; then
+        echo "FAIL (no quota found)"
+        ((FAIL++))
+        return
+    fi
+
+    if [ "$secs" -gt "$quota" ]; then
+        echo "PASS (${secs}s > ${quota}s)"
+        ((PASS++))
+    else
+        echo "FAIL (${secs}s <= ${quota}s, expected to exceed)"
+        ((FAIL++))
+    fi
+}
+
+test_quota_exceeded "Quota limit exceeded"  youtube_45sec.pcap  30
+test "Quota not exceeded"                   youtube_45sec.pcap  "Would block" "-q 60" "no"
+
+# --- Video-only mode tests ---
+test "Video-only tracks YouTube"    youtube_45sec.pcap    "YouTube" "-V"
+
+# --- Subnet filtering tests ---
+test "Wrong subnet no tracking"     youtube_45sec.pcap    "STREAMING" "-s 10.0.0.0" "no"
+
+# --- State persistence tests ---
+test_state() {
+    local name="$1" pcap="$2"
+    local state_file="/tmp/streamguard_test_$$.json"
+    printf "%-45s" "$name..."
+
+    if [ ! -f "pcaps/$pcap" ]; then
+        echo "SKIP (pcap not found)"
+        return
+    fi
+
+    # Run with state file
+    $STREAMGUARD -r "pcaps/$pcap" -f "$state_file" >/dev/null 2>&1
+
+    # Check state file exists and contains client data
+    if [ -f "$state_file" ] && grep -q "streaming_seconds" "$state_file"; then
+        echo "PASS"
+        ((PASS++))
+        rm -f "$state_file"
+    else
+        echo "FAIL (state file not created or invalid)"
+        ((FAIL++))
+        rm -f "$state_file"
+    fi
+}
+
+test_state "State file created"     youtube_45sec.pcap
 
 # --- Quota measurement tests ---
 test_quota "YouTube quota (30-50s expected)"   youtube_45sec.pcap   30 50

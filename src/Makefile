@@ -32,7 +32,20 @@ clean:
 install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/
 
+# Run all tests (unit + integration)
 test: $(TARGET)
-	cd ../test && ./run_tests.sh
+	$(MAKE) -C ../test check
 
-.PHONY: all debug clean install test
+# Run unit tests only
+test-unit: $(TARGET)
+	$(MAKE) -C ../test check-unit
+
+# Run integration tests only
+test-integration: $(TARGET)
+	$(MAKE) -C ../test integration
+
+# TAP output for CI
+test-tap: $(TARGET)
+	$(MAKE) -C ../test tap
+
+.PHONY: all debug clean install test test-unit test-integration test-tap
