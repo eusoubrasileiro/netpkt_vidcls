@@ -98,6 +98,11 @@ static char *state_file_path = NULL;
 static char *input_pcap = NULL;  /* Read from file instead of live capture */
 static uint64_t pcap_time_ms = 0;  /* Current time from pcap timestamps (for replay mode) */
 
+/* Remote router configuration for SSH-based blocking */
+static char *router_ip = NULL;      /* -R: Router IP for SSH commands */
+static char *ssh_user = "root";     /* -u: SSH user (default: root) */
+static char *ssh_keyfile = NULL;    /* -k: SSH key path (optional) */
+
 /* Get current time - uses pcap timestamps when replaying, wall clock otherwise */
 static uint64_t get_current_time_ms(void) {
     if (input_pcap != NULL && pcap_time_ms > 0) {
@@ -157,25 +162,61 @@ static void get_current_date(char *buf, size_t len) {
     strftime(buf, len, "%Y-%m-%d", tm);
 }
 
-/* Block client via nftables */
+/* Execute nft command via SSH (if router configured) or locally */
+static int execute_nft_command(const char *nft_cmd) {
+    char cmd[512];
+
+    if (router_ip != NULL) {
+        if (ssh_keyfile != NULL) {
+            snprintf(cmd, sizeof(cmd),
+                "ssh -o ConnectTimeout=5 -o BatchMode=yes -i %s %s@%s \"%s\"",
+                ssh_keyfile, ssh_user, router_ip, nft_cmd);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                "ssh -o ConnectTimeout=5 -o BatchMode=yes %s@%s \"%s\"",
+                ssh_user, router_ip, nft_cmd);
+        }
+    } else {
+        snprintf(cmd, sizeof(cmd), "%s", nft_cmd);
+    }
+
+    if (debug_mode) printf("[DEBUG] Executing: %s\n", cmd);
+    return system(cmd);
+}
+
+/* Add streaming destination IP to router's nftables set */
+static void add_streaming_destination(uint32_t dest_ip) {
+    if (!enforce_mode || is_lan_ip(dest_ip)) return;
+
+    char nft_cmd[256];
+    snprintf(nft_cmd, sizeof(nft_cmd),
+        "nft add element inet fw4 streaming_destinations '{ %s timeout 1h }'",
+        ip_to_str(dest_ip));
+
+    execute_nft_command(nft_cmd);  /* Duplicates silently ignored by nft */
+}
+
+/* Block client via nftables (local or remote via SSH) */
 static void block_client(uint32_t client_ip) {
     const char *ip_str = ip_to_str(client_ip);
     int idx = get_client_index(client_ip);
     if (clients[idx].is_blocked) return;  /* Already blocked */
 
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
+    char nft_cmd[256];
+    snprintf(nft_cmd, sizeof(nft_cmd),
         "nft add element inet fw4 blocked_streaming_clients '{ %s timeout 24h }'",
         ip_str);
 
     if (enforce_mode) {
-        int ret = system(cmd);
+        int ret = execute_nft_command(nft_cmd);
         if (ret == 0) {
             clients[idx].is_blocked = 1;
-            printf("[BLOCKED] %s (quota exceeded: %lu/%lu seconds)\n",
-                   ip_str, clients[idx].streaming_seconds, daily_quota);
+            printf("[BLOCKED] %s (quota exceeded: %lu/%lu seconds)%s\n",
+                   ip_str, clients[idx].streaming_seconds, daily_quota,
+                   router_ip ? " [remote]" : "");
         } else {
-            printf("[ERROR] Failed to block %s (nft returned %d)\n", ip_str, ret);
+            printf("[ERROR] Failed to block %s (%s returned %d)\n",
+                   ip_str, router_ip ? "SSH" : "nft", ret);
         }
     } else {
         printf("[DRY-RUN] Would block %s (quota exceeded: %lu/%lu seconds)\n",
@@ -183,22 +224,26 @@ static void block_client(uint32_t client_ip) {
     }
 }
 
-/* Unblock client via nftables */
+/* Unblock client via nftables (local or remote via SSH) */
 static void unblock_client(uint32_t client_ip) {
     const char *ip_str = ip_to_str(client_ip);
     int idx = get_client_index(client_ip);
     if (!clients[idx].is_blocked) return;  /* Not blocked */
 
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
+    char nft_cmd[256];
+    snprintf(nft_cmd, sizeof(nft_cmd),
         "nft delete element inet fw4 blocked_streaming_clients '{ %s }'",
         ip_str);
 
     if (enforce_mode) {
-        int ret = system(cmd);
+        int ret = execute_nft_command(nft_cmd);
         if (ret == 0) {
             clients[idx].is_blocked = 0;
-            printf("[UNBLOCKED] %s (daily reset)\n", ip_str);
+            printf("[UNBLOCKED] %s (daily reset)%s\n",
+                   ip_str, router_ip ? " [remote]" : "");
+        } else {
+            printf("[ERROR] Failed to unblock %s (%s returned %d)\n",
+                   ip_str, router_ip ? "SSH" : "nft", ret);
         }
     } else {
         printf("[DRY-RUN] Would unblock %s (daily reset)\n", ip_str);
@@ -584,6 +629,10 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
                        proto_name, proto_transport, cat_name, src_str, ntohs(src_port),
                        dst_str, ntohs(dst_port), host);
 
+                /* Add streaming destination to router's nftables set */
+                uint32_t stream_dst = is_lan_ip(src_ip) ? dst_ip : src_ip;
+                add_streaming_destination(stream_dst);
+
                 /* Update session tracking for this client */
                 uint32_t client_ip = is_lan_ip(src_ip) ? src_ip : dst_ip;
                 int idx = get_client_index(client_ip);
@@ -640,10 +689,15 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -m <mask>    LAN netmask (default: %s)\n", LAN_MASK);
     fprintf(stderr, "  -q <secs>    Daily quota in seconds (default: 3600)\n");
     fprintf(stderr, "  -f <file>    Enable state persistence to file (disabled by default)\n");
+    fprintf(stderr, "  -R <router>  Remote router IP for SSH-based blocking\n");
+    fprintf(stderr, "  -u <user>    SSH user for remote router (default: root)\n");
+    fprintf(stderr, "  -k <keyfile> SSH key file for remote router (uses default if omitted)\n");
     fprintf(stderr, "  -e           Enable enforcement mode (add blocked IPs to nftables)\n");
     fprintf(stderr, "  -V           Video-only mode (ignore social media browsing)\n");
     fprintf(stderr, "  -d           Enable debug mode (verbose protocol logging)\n");
     fprintf(stderr, "  -h           Show this help\n");
+    fprintf(stderr, "\nRemote blocking (Ubuntu captures, OpenWrt blocks):\n");
+    fprintf(stderr, "  sudo ./streamguard -i eno1 -e -R 192.168.0.1\n");
     fprintf(stderr, "\nDefault: tracks all social media (Instagram, Facebook) + video streaming.\n");
     fprintf(stderr, "With -V: only tracks pure video streaming (YouTube, Netflix, TikTok).\n");
     fprintf(stderr, "Without -e, runs in dry-run mode (logs only, no blocking).\n");
@@ -700,7 +754,7 @@ int main(int argc, char *argv[]) {
     char errbuf[PCAP_ERRBUF_SIZE];
     int opt;
 
-    while ((opt = getopt(argc, argv, "i:r:s:m:q:f:eVdh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:r:s:m:q:f:R:u:k:eVdh")) != -1) {
         switch (opt) {
             case 'i': interface = optarg; break;
             case 'r': input_pcap = optarg; break;
@@ -708,6 +762,9 @@ int main(int argc, char *argv[]) {
             case 'm': mask = optarg; break;
             case 'q': daily_quota = (uint64_t)atol(optarg); break;
             case 'f': state_file_path = optarg; break;
+            case 'R': router_ip = optarg; break;
+            case 'u': ssh_user = optarg; break;
+            case 'k': ssh_keyfile = optarg; break;
             case 'e': enforce_mode = 1; break;
             case 'V': video_only_mode = 1; break;
             case 'd': debug_mode = 1; break;
@@ -729,18 +786,19 @@ int main(int argc, char *argv[]) {
 
     printf("StreamGuard - Video Streaming Quota Enforcement\n");
     const char *tracking_mode = video_only_mode ? "VIDEO-ONLY" : "ALL-SOCIAL";
+    const char *exec_mode = enforce_mode ? "ENFORCE" : "DRY-RUN";
     if (input_pcap) {
-        printf("Input: %s | LAN: %s/%s | Quota: %lu sec | %s | %s\n\n",
+        printf("Input: %s | LAN: %s/%s | Quota: %lu sec | %s | %s",
                strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap,
-               subnet, mask, daily_quota,
-               tracking_mode,
-               enforce_mode ? "ENFORCE" : "DRY-RUN");
+               subnet, mask, daily_quota, tracking_mode, exec_mode);
     } else {
-        printf("Interface: %s | LAN: %s/%s | Quota: %lu sec | %s | %s\n\n",
-               interface, subnet, mask, daily_quota,
-               tracking_mode,
-               enforce_mode ? "ENFORCE" : "DRY-RUN");
+        printf("Interface: %s | LAN: %s/%s | Quota: %lu sec | %s | %s",
+               interface, subnet, mask, daily_quota, tracking_mode, exec_mode);
     }
+    if (router_ip) {
+        printf(" | Router: %s@%s", ssh_user, router_ip);
+    }
+    printf("\n\n");
 
     /* Initialize nDPI (5.0 API - all protocols enabled by default) */
     ndpi_module = ndpi_init_detection_module(NULL);
