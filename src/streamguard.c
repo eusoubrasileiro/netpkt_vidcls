@@ -67,7 +67,7 @@ struct client_info {
     uint64_t last_streaming_activity_ms; /* Last streaming packet timestamp */
 };
 
-/* Get current time in milliseconds */
+/* Get current time in milliseconds (wall clock) */
 static uint64_t get_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -89,6 +89,15 @@ static uint64_t daily_quota = 3600;  /* seconds */
 static time_t last_state_save = 0;
 static char *state_file_path = NULL;
 static char *input_pcap = NULL;  /* Read from file instead of live capture */
+static uint64_t pcap_time_ms = 0;  /* Current time from pcap timestamps (for replay mode) */
+
+/* Get current time - uses pcap timestamps when replaying, wall clock otherwise */
+static uint64_t get_current_time_ms(void) {
+    if (input_pcap != NULL && pcap_time_ms > 0) {
+        return pcap_time_ms;
+    }
+    return get_time_ms();
+}
 
 /* Check if protocol is a social media platform (Instagram, Facebook) */
 static int is_social_media_protocol(ndpi_protocol proto) {
@@ -365,7 +374,7 @@ static struct flow_info *get_flow(uint32_t src_ip, uint32_t dst_ip,
             f->src_port = norm_port1;
             f->dst_port = norm_port2;
             f->protocol = protocol;
-            f->first_seen_ms = get_time_ms();
+            f->first_seen_ms = get_current_time_ms();
             f->last_seen_ms = f->first_seen_ms;
             f->in_use = 1;
 
@@ -381,7 +390,7 @@ static struct flow_info *get_flow(uint32_t src_ip, uint32_t dst_ip,
         if (f->src_ip == norm_ip1 && f->dst_ip == norm_ip2 &&
             f->src_port == norm_port1 && f->dst_port == norm_port2 &&
             f->protocol == protocol) {
-            f->last_seen_ms = get_time_ms();
+            f->last_seen_ms = get_current_time_ms();
             return f;
         }
 
@@ -399,7 +408,7 @@ static void free_flow(struct flow_info *f) {
 
 /* Process expired flows */
 static void expire_flows(void) {
-    uint64_t now_ms = get_time_ms();
+    uint64_t now_ms = get_current_time_ms();
 
     for (int i = 0; i < MAX_FLOWS; i++) {
         struct flow_info *f = &flows[i];
@@ -433,7 +442,7 @@ static void expire_flows(void) {
 
 /* Check for streaming session timeouts */
 static void check_session_timeouts(void) {
-    uint64_t now_ms = get_time_ms();
+    uint64_t now_ms = get_current_time_ms();
 
     for (int i = 0; i < 256; i++) {
         if (!clients[i].in_use || clients[i].session_start_ms == 0)
@@ -464,6 +473,9 @@ static void check_session_timeouts(void) {
 static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
                            const u_char *packet) {
     (void)user;
+
+    /* Update pcap time from packet timestamp (for replay mode) */
+    pcap_time_ms = (uint64_t)header->ts.tv_sec * 1000 + header->ts.tv_usec / 1000;
 
     /* Skip ethernet header (14 bytes) */
     const struct ip *ip_header = (const struct ip *)(packet + 14);
@@ -568,7 +580,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
                 /* Update session tracking for this client */
                 uint32_t client_ip = is_lan_ip(src_ip) ? src_ip : dst_ip;
                 int idx = get_client_index(client_ip);
-                uint64_t now_ms = get_time_ms();
+                uint64_t now_ms = get_current_time_ms();
 
                 clients[idx].ip = client_ip;
                 clients[idx].in_use = 1;
@@ -599,7 +611,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
         uint32_t client_ip = is_lan_ip(flow->src_ip) ? flow->src_ip : flow->dst_ip;
         int idx = get_client_index(client_ip);
         if (clients[idx].session_start_ms != 0) {
-            clients[idx].last_streaming_activity_ms = get_time_ms();
+            clients[idx].last_streaming_activity_ms = get_current_time_ms();
         }
     }
 }
@@ -734,22 +746,31 @@ int main(int argc, char *argv[]) {
         int ret = pcap_next_ex(pcap_handle, &header, &packet);
         if (ret == 1) {
             packet_handler(NULL, header, packet);
+            /* In replay mode, check session timeouts after each packet */
+            if (input_pcap != NULL) {
+                check_session_timeouts();
+            }
+        } else if (ret == -2) {
+            /* End of pcap file */
+            break;
         } else if (ret == -1) {
             fprintf(stderr, "pcap error: %s\n", pcap_geterr(pcap_handle));
             break;
         }
 
-        /* Periodic maintenance */
-        time_t now = time(NULL);
-        if (now - last_expire >= 5) {
-            expire_flows();
-            check_session_timeouts();
-            check_daily_reset();
-            last_expire = now;
+        /* Periodic maintenance (live capture only) */
+        if (input_pcap == NULL) {
+            time_t now = time(NULL);
+            if (now - last_expire >= 5) {
+                expire_flows();
+                check_session_timeouts();
+                check_daily_reset();
+                last_expire = now;
 
-            /* Save state periodically */
-            if (now - last_state_save >= SAVE_INTERVAL) {
-                save_state();
+                /* Save state periodically */
+                if (now - last_state_save >= SAVE_INTERVAL) {
+                    save_state();
+                }
             }
         }
     }
@@ -757,7 +778,7 @@ int main(int argc, char *argv[]) {
     printf("\nShutting down...\n");
 
     /* End any active streaming sessions */
-    uint64_t now_ms = get_time_ms();
+    uint64_t now_ms = get_current_time_ms();
     for (int i = 0; i < 256; i++) {
         if (clients[i].in_use && clients[i].session_start_ms != 0) {
             /* Session was active - count time up to now */

@@ -1,0 +1,5 @@
+# Large pcap files (keep small test pcaps only)
+*.pcap
+
+# But track the pcaps directory structure
+!pcaps/.gitkeep

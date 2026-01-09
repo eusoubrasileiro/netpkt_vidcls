@@ -32,4 +32,7 @@ clean:
 install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/
 
-.PHONY: all debug clean install
+test: $(TARGET)
+	cd ../test && ./run_tests.sh
+
+.PHONY: all debug clean install test
