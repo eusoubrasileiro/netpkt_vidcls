@@ -102,6 +102,8 @@ static uint64_t pcap_time_ms = 0;  /* Current time from pcap timestamps (for rep
 static char *router_ip = NULL;      /* -R: Router IP for SSH commands */
 static char *ssh_user = "root";     /* -u: SSH user (default: root) */
 static char *ssh_keyfile = NULL;    /* -k: SSH key path (optional) */
+static char *firewall_type = "nft"; /* -F: "nft" (nftables) or "ipset" (iptables) */
+static char *unblock_ip = NULL;     /* -U: IP to unblock and exit */
 
 /* Get current time - uses pcap timestamps when replaying, wall clock otherwise */
 static uint64_t get_current_time_ms(void) {
@@ -162,53 +164,64 @@ static void get_current_date(char *buf, size_t len) {
     strftime(buf, len, "%Y-%m-%d", tm);
 }
 
-/* Execute nft command via SSH (if router configured) or locally */
-static int execute_nft_command(const char *nft_cmd) {
+/* Execute firewall command via SSH (if router configured) or locally
+ * Supports both nftables (fw4) and iptables/ipset (fw3) based on firewall_type
+ * action: "add" or "del"
+ * set_name: e.g., "blocked_streaming_clients" or "streaming_destinations"
+ * ip: IP address to add/remove
+ */
+static int execute_firewall_command(const char *action, const char *set_name, const char *ip) {
+    char fw_cmd[256];
     char cmd[512];
 
+    /* Build firewall-specific command */
+    if (strcmp(firewall_type, "ipset") == 0) {
+        /* iptables/ipset (fw3): ipset add/del set_name IP */
+        snprintf(fw_cmd, sizeof(fw_cmd), "ipset %s %s %s 2>/dev/null",
+                 action, set_name, ip);
+    } else {
+        /* nftables (fw4): nft add/delete element inet fw4 set_name '{ IP }' */
+        const char *nft_action = (strcmp(action, "add") == 0) ? "add" : "delete";
+        snprintf(fw_cmd, sizeof(fw_cmd),
+                 "nft %s element inet fw4 %s '{ %s }' 2>/dev/null",
+                 nft_action, set_name, ip);
+    }
+
+    /* Wrap with SSH if remote router configured */
     if (router_ip != NULL) {
         if (ssh_keyfile != NULL) {
             snprintf(cmd, sizeof(cmd),
                 "ssh -o ConnectTimeout=5 -o BatchMode=yes -i %s %s@%s \"%s\"",
-                ssh_keyfile, ssh_user, router_ip, nft_cmd);
+                ssh_keyfile, ssh_user, router_ip, fw_cmd);
         } else {
             snprintf(cmd, sizeof(cmd),
                 "ssh -o ConnectTimeout=5 -o BatchMode=yes %s@%s \"%s\"",
-                ssh_user, router_ip, nft_cmd);
+                ssh_user, router_ip, fw_cmd);
         }
     } else {
-        snprintf(cmd, sizeof(cmd), "%s", nft_cmd);
+        snprintf(cmd, sizeof(cmd), "%s", fw_cmd);
     }
 
     if (debug_mode) printf("[DEBUG] Executing: %s\n", cmd);
     return system(cmd);
 }
 
-/* Add streaming destination IP to router's nftables set */
+/* Add streaming destination IP to router's firewall set */
 static void add_streaming_destination(uint32_t dest_ip) {
     if (!enforce_mode || is_lan_ip(dest_ip)) return;
 
-    char nft_cmd[256];
-    snprintf(nft_cmd, sizeof(nft_cmd),
-        "nft add element inet fw4 streaming_destinations '{ %s timeout 1h }'",
-        ip_to_str(dest_ip));
-
-    execute_nft_command(nft_cmd);  /* Duplicates silently ignored by nft */
+    /* Duplicates silently ignored by both nft and ipset */
+    execute_firewall_command("add", "streaming_destinations", ip_to_str(dest_ip));
 }
 
-/* Block client via nftables (local or remote via SSH) */
+/* Block client via firewall (nftables or ipset) */
 static void block_client(uint32_t client_ip) {
     const char *ip_str = ip_to_str(client_ip);
     int idx = get_client_index(client_ip);
     if (clients[idx].is_blocked) return;  /* Already blocked */
 
-    char nft_cmd[256];
-    snprintf(nft_cmd, sizeof(nft_cmd),
-        "nft add element inet fw4 blocked_streaming_clients '{ %s timeout 24h }'",
-        ip_str);
-
     if (enforce_mode) {
-        int ret = execute_nft_command(nft_cmd);
+        int ret = execute_firewall_command("add", "blocked_streaming_clients", ip_str);
         if (ret == 0) {
             clients[idx].is_blocked = 1;
             printf("[BLOCKED] %s (quota exceeded: %lu/%lu seconds)%s\n",
@@ -216,7 +229,7 @@ static void block_client(uint32_t client_ip) {
                    router_ip ? " [remote]" : "");
         } else {
             printf("[ERROR] Failed to block %s (%s returned %d)\n",
-                   ip_str, router_ip ? "SSH" : "nft", ret);
+                   ip_str, router_ip ? "SSH" : firewall_type, ret);
         }
     } else {
         printf("[DRY-RUN] Would block %s (quota exceeded: %lu/%lu seconds)\n",
@@ -224,26 +237,21 @@ static void block_client(uint32_t client_ip) {
     }
 }
 
-/* Unblock client via nftables (local or remote via SSH) */
+/* Unblock client via firewall (nftables or ipset) */
 static void unblock_client(uint32_t client_ip) {
     const char *ip_str = ip_to_str(client_ip);
     int idx = get_client_index(client_ip);
     if (!clients[idx].is_blocked) return;  /* Not blocked */
 
-    char nft_cmd[256];
-    snprintf(nft_cmd, sizeof(nft_cmd),
-        "nft delete element inet fw4 blocked_streaming_clients '{ %s }'",
-        ip_str);
-
     if (enforce_mode) {
-        int ret = execute_nft_command(nft_cmd);
+        int ret = execute_firewall_command("del", "blocked_streaming_clients", ip_str);
         if (ret == 0) {
             clients[idx].is_blocked = 0;
             printf("[UNBLOCKED] %s (daily reset)%s\n",
                    ip_str, router_ip ? " [remote]" : "");
         } else {
             printf("[ERROR] Failed to unblock %s (%s returned %d)\n",
-                   ip_str, router_ip ? "SSH" : "nft", ret);
+                   ip_str, router_ip ? "SSH" : firewall_type, ret);
         }
     } else {
         printf("[DRY-RUN] Would unblock %s (daily reset)\n", ip_str);
@@ -492,7 +500,7 @@ static void expire_flows(void) {
     }
 }
 
-/* Check for streaming session timeouts */
+/* Check for streaming session timeouts and quota violations */
 static void check_session_timeouts(void) {
     uint64_t now_ms = get_current_time_ms();
 
@@ -515,6 +523,21 @@ static void check_session_timeouts(void) {
 
             /* Check if quota exceeded */
             if (clients[i].streaming_seconds >= daily_quota) {
+                block_client(clients[i].ip);
+            }
+        }
+        /* Check quota during ACTIVE sessions (not just at timeout) */
+        else if (!clients[i].is_blocked) {
+            uint64_t session_duration_sec = (now_ms - clients[i].session_start_ms) / 1000;
+            uint64_t effective_time = clients[i].streaming_seconds + session_duration_sec;
+
+            if (effective_time >= daily_quota) {
+                /* Accumulate session time and block immediately */
+                clients[i].streaming_seconds = effective_time;
+                clients[i].session_start_ms = now_ms;  /* Reset to avoid double-counting */
+
+                printf("[QUOTA_EXCEEDED] %s | %lu/%lu sec (blocked during active session)\n",
+                       ip_to_str(clients[i].ip), clients[i].streaming_seconds, daily_quota);
                 block_client(clients[i].ip);
             }
         }
@@ -681,7 +704,8 @@ static void signal_handler(int sig) {
 /* Print usage */
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [-i <interface> | -r <pcap_file>] [options]\n", prog);
-    fprintf(stderr, "\nInput (one required):\n");
+    fprintf(stderr, "       %s -U <ip> -R <router> [-F ipset] [-k keyfile]\n", prog);
+    fprintf(stderr, "\nInput (one required for monitoring mode):\n");
     fprintf(stderr, "  -i <iface>   Live capture from network interface (e.g., eth0, br-lan)\n");
     fprintf(stderr, "  -r <file>    Read from pcap file (use '-' for stdin)\n");
     fprintf(stderr, "\nOptions:\n");
@@ -692,12 +716,19 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -R <router>  Remote router IP for SSH-based blocking\n");
     fprintf(stderr, "  -u <user>    SSH user for remote router (default: root)\n");
     fprintf(stderr, "  -k <keyfile> SSH key file for remote router (uses default if omitted)\n");
-    fprintf(stderr, "  -e           Enable enforcement mode (add blocked IPs to nftables)\n");
+    fprintf(stderr, "  -F <type>    Firewall type: 'nft' (nftables/fw4) or 'ipset' (iptables/fw3)\n");
+    fprintf(stderr, "  -U <ip>      Unblock a client IP and exit (requires -R)\n");
+    fprintf(stderr, "  -e           Enable enforcement mode (add blocked IPs to firewall)\n");
     fprintf(stderr, "  -V           Video-only mode (ignore social media browsing)\n");
     fprintf(stderr, "  -d           Enable debug mode (verbose protocol logging)\n");
     fprintf(stderr, "  -h           Show this help\n");
     fprintf(stderr, "\nRemote blocking (Ubuntu captures, OpenWrt blocks):\n");
+    fprintf(stderr, "  # OpenWrt 22.03+ (fw4/nftables - default):\n");
     fprintf(stderr, "  sudo ./streamguard -i eno1 -e -R 192.168.0.1\n");
+    fprintf(stderr, "  # OpenWrt 21.02 and older (fw3/iptables):\n");
+    fprintf(stderr, "  sudo ./streamguard -i eno1 -e -R 192.168.0.1 -F ipset\n");
+    fprintf(stderr, "\nUnblock a client:\n");
+    fprintf(stderr, "  sudo ./streamguard -R 192.168.0.1 -F ipset -U 192.168.0.25\n");
     fprintf(stderr, "\nDefault: tracks all social media (Instagram, Facebook) + video streaming.\n");
     fprintf(stderr, "With -V: only tracks pure video streaming (YouTube, Netflix, TikTok).\n");
     fprintf(stderr, "Without -e, runs in dry-run mode (logs only, no blocking).\n");
@@ -754,7 +785,7 @@ int main(int argc, char *argv[]) {
     char errbuf[PCAP_ERRBUF_SIZE];
     int opt;
 
-    while ((opt = getopt(argc, argv, "i:r:s:m:q:f:R:u:k:eVdh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:r:s:m:q:f:R:u:k:F:U:eVdh")) != -1) {
         switch (opt) {
             case 'i': interface = optarg; break;
             case 'r': input_pcap = optarg; break;
@@ -765,12 +796,34 @@ int main(int argc, char *argv[]) {
             case 'R': router_ip = optarg; break;
             case 'u': ssh_user = optarg; break;
             case 'k': ssh_keyfile = optarg; break;
+            case 'F': firewall_type = optarg; break;
+            case 'U': unblock_ip = optarg; break;
             case 'e': enforce_mode = 1; break;
             case 'V': video_only_mode = 1; break;
             case 'd': debug_mode = 1; break;
             case 'h':
             default: usage(argv[0]);
         }
+    }
+
+    /* Handle unblock mode - unblock IP and exit */
+    if (unblock_ip != NULL) {
+        if (router_ip == NULL) {
+            fprintf(stderr, "Error: -U requires -R (router IP)\n");
+            return 1;
+        }
+        struct in_addr addr;
+        if (inet_pton(AF_INET, unblock_ip, &addr) != 1) {
+            fprintf(stderr, "Invalid IP address: %s\n", unblock_ip);
+            return 1;
+        }
+        enforce_mode = 1;  /* Enable to actually run command */
+        int idx = get_client_index(addr.s_addr);
+        clients[idx].ip = addr.s_addr;
+        clients[idx].is_blocked = 1;  /* Set blocked so unblock_client works */
+        clients[idx].in_use = 1;
+        unblock_client(addr.s_addr);
+        return 0;
     }
 
     if (!interface && !input_pcap) usage(argv[0]);
@@ -796,7 +849,7 @@ int main(int argc, char *argv[]) {
                interface, subnet, mask, daily_quota, tracking_mode, exec_mode);
     }
     if (router_ip) {
-        printf(" | Router: %s@%s", ssh_user, router_ip);
+        printf(" | Router: %s@%s (%s)", ssh_user, router_ip, firewall_type);
     }
     printf("\n\n");
 

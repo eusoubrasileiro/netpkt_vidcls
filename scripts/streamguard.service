@@ -1,35 +1,35 @@
 [Unit]
 Description=StreamGuard Video Streaming Quota Enforcement
-Documentation=https://github.com/yourusername/streamguard
 After=network.target
 
 [Service]
 Type=simple
-
-# Run as root to capture packets
 User=root
 
-# Main executable with sensible defaults
-# Adjust -i (interface), -q (quota seconds), and -s/-m (subnet/mask) as needed
-ExecStart=/usr/local/bin/streamguard -i eth0 -e -q 3600 -f /var/lib/streamguard/state.json
+# Configuration - adjust these for your setup:
+#   -i <iface>   Network interface (eno1, eth0, etc.)
+#   -R <router>  Router IP for SSH-based blocking
+#   -F <type>    Firewall: 'nft' (OpenWrt 22.03+) or 'ipset' (OpenWrt 21.02)
+#   -k <key>     SSH key file for router access
+#   -q <secs>    Daily quota in seconds (3600 = 1 hour)
+#   -f <file>    State file for persistence across restarts
+#   -e           Enable enforcement (required for blocking)
+#
+# Example for OpenWrt 21.02 with ipset:
+ExecStart=/usr/local/bin/streamguard -i eno1 -e -R 192.168.0.1 -F ipset -q 3600 -f /var/lib/streamguard/state.json -k /root/.ssh/id_rsa
 
-# State directory - systemd creates this automatically
 StateDirectory=streamguard
-
-# Restart on failure
 Restart=on-failure
 RestartSec=5
-
-# Graceful shutdown
 KillSignal=SIGTERM
 TimeoutStopSec=10
 
-# Security hardening (still needs CAP_NET_RAW for pcap)
+# Security (needs CAP_NET_RAW for packet capture, CAP_NET_ADMIN for some operations)
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 ReadWritePaths=/var/lib/streamguard
 
 [Install]
