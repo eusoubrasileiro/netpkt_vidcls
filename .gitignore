@@ -5,6 +5,9 @@ src/streamguard
 # nDPI (build from source separately)
 nDPI/
 
+# libpcap with --enable-remote (build from source)
+libpcap/
+
 # Runtime state and logs
 *_state.json
 *.log

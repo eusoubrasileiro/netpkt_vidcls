@@ -12,8 +12,18 @@ else
     NDPI_LIBS = $(shell pkg-config --libs libndpi)
 endif
 
-CFLAGS = -Wall -Wextra -O2 $(NDPI_CFLAGS)
-LDFLAGS = $(NDPI_LIBS) -lpcap -lcjson
+# Use local libpcap build (../libpcap) if available (with --enable-remote support)
+PCAP_LOCAL = ../libpcap
+ifneq ($(wildcard $(PCAP_LOCAL)/libpcap.a),)
+    PCAP_CFLAGS = -I$(PCAP_LOCAL) -DHAVE_REMOTE
+    PCAP_LIBS = $(PCAP_LOCAL)/libpcap.a -libverbs -lssl -lcrypto -ldbus-1
+else
+    PCAP_CFLAGS =
+    PCAP_LIBS = -lpcap
+endif
+
+CFLAGS = -Wall -Wextra -O2 $(NDPI_CFLAGS) $(PCAP_CFLAGS)
+LDFLAGS = $(NDPI_LIBS) $(PCAP_LIBS) -lcjson
 
 TARGET = streamguard
 SRCS = streamguard.c log.c

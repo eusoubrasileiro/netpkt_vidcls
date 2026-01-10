@@ -22,6 +22,8 @@ LDFLAGS = $(NDPI_LIBS) -lpcap -lcjson $(CRITERION_LIBS)
 # Source files
 STREAMGUARD_SRC = ../src/streamguard.c
 STREAMGUARD_OBJ = streamguard_test.o
+LOG_SRC = ../src/log.c
+LOG_OBJ = log_test.o
 
 # Unit test files
 UNIT_SRCS = $(wildcard unit/*.c)
@@ -35,9 +37,13 @@ all: unit
 $(STREAMGUARD_OBJ): $(STREAMGUARD_SRC)
 	$(CC) $(CFLAGS) -Dmain=streamguard_main -c -o $@ $<
 
+# Build log.c as object file
+$(LOG_OBJ): $(LOG_SRC)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 # Build each unit test binary
-unit/%: unit/%.c $(STREAMGUARD_OBJ)
-	$(CC) $(CFLAGS) -I../src -o $@ $< $(STREAMGUARD_OBJ) $(LDFLAGS)
+unit/%: unit/%.c $(STREAMGUARD_OBJ) $(LOG_OBJ)
+	$(CC) $(CFLAGS) -I../src -o $@ $< $(STREAMGUARD_OBJ) $(LOG_OBJ) $(LDFLAGS)
 
 # Build all unit tests
 unit: $(UNIT_BINS)

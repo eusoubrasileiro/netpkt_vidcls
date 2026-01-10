@@ -1,36 +1,38 @@
 [Unit]
 Description=StreamGuard Video Streaming Quota Enforcement
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
 
-# Configuration - adjust these for your setup:
-#   -i <iface>   Network interface (eno1, eth0, etc.)
+# Remote packet capture from OpenWrt router via rpcapd
+#
+# Options:
+#   -r <source>  rpcap://router/interface for remote capture
 #   -R <router>  Router IP for SSH-based blocking
 #   -F <type>    Firewall: 'nft' (OpenWrt 22.03+) or 'ipset' (OpenWrt 21.02)
 #   -k <key>     SSH key file for router access
-#   -q <secs>    Daily quota in seconds (3600 = 1 hour)
+#   -q <secs>    Daily quota in seconds (1800 = 30 min)
 #   -f <file>    State file for persistence across restarts
+#   -L <file>    Log file path
 #   -e           Enable enforcement (required for blocking)
 #
-# Example for OpenWrt 21.02 with ipset:
-ExecStart=/usr/local/bin/streamguard -i eno1 -e -R 192.168.0.1 -F ipset -q 3600 -f /var/lib/streamguard/state.json -k /root/.ssh/id_rsa
+ExecStart=/usr/local/bin/streamguard \
+    -r rpcap://192.168.0.1/br-lan \
+    -e -R 192.168.0.1 -F ipset \
+    -q 1800 \
+    -f /var/lib/streamguard/state.json \
+    -L /var/log/streamguard.log \
+    -k /root/.ssh/id_rsa
 
 StateDirectory=streamguard
+LogsDirectory=streamguard
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=10
-
-# Security (needs CAP_NET_RAW for packet capture, CAP_NET_ADMIN for some operations)
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/var/lib/streamguard
 
 [Install]
 WantedBy=multi-user.target

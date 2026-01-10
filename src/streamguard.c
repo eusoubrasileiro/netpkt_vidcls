@@ -21,7 +21,14 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
-#include <pcap.h>
+#include <pcap/pcap.h>
+
+/* Check if libpcap has remote capture support (rpcap://) */
+#ifdef HAVE_REMOTE
+#define RPCAP_ENABLED 1
+#else
+#define RPCAP_ENABLED 0
+#endif
 #include <ndpi_api.h>
 #include <cjson/cJSON.h>
 #include <sys/stat.h>
@@ -706,11 +713,12 @@ static void signal_handler(int sig) {
 
 /* Print usage */
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s [-i <interface> | -r <pcap_file>] [options]\n", prog);
+    fprintf(stderr, "Usage: %s [-i <interface> | -r <source>] [options]\n", prog);
     fprintf(stderr, "       %s -U <ip> -R <router> [-F ipset] [-k keyfile]\n", prog);
     fprintf(stderr, "\nInput (one required for monitoring mode):\n");
     fprintf(stderr, "  -i <iface>   Live capture from network interface (e.g., eth0, br-lan)\n");
-    fprintf(stderr, "  -r <file>    Read from pcap file (use '-' for stdin)\n");
+    fprintf(stderr, "  -r <source>  Read from pcap file, stdin ('-'), or rpcap:// URL\n");
+    fprintf(stderr, "               rpcap:// requires libpcap built with --enable-remote\n");
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -s <subnet>  LAN subnet (default: %s)\n", LAN_SUBNET);
     fprintf(stderr, "  -m <mask>    LAN netmask (default: %s)\n", LAN_MASK);
@@ -726,6 +734,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -V           Video-only mode (ignore social media browsing)\n");
     fprintf(stderr, "  -d           Enable debug mode (verbose protocol logging)\n");
     fprintf(stderr, "  -h           Show this help\n");
+    fprintf(stderr, "\nRemote capture via rpcapd (recommended):\n");
+    fprintf(stderr, "  # Router runs rpcapd, Ubuntu captures and enforces:\n");
+    fprintf(stderr, "  sudo ./streamguard -r rpcap://192.168.0.1/br-lan -e -R 192.168.0.1\n");
     fprintf(stderr, "\nRemote blocking (Ubuntu captures, OpenWrt blocks):\n");
     fprintf(stderr, "  # OpenWrt 22.03+ (fw4/nftables - default):\n");
     fprintf(stderr, "  sudo ./streamguard -i eno1 -e -R 192.168.0.1\n");
@@ -894,15 +905,43 @@ int main(int argc, char *argv[]) {
     load_state();
     check_daily_reset();
 
-    /* Open pcap - either from file or live interface */
+    /* Open pcap - rpcap:// URL, local file, stdin, or live interface */
     if (input_pcap) {
-        pcap_handle = pcap_open_offline(input_pcap, errbuf);
-        if (!pcap_handle) {
-            log_fatal("pcap_open_offline failed: %s", errbuf);
+#if RPCAP_ENABLED
+        if (strncmp(input_pcap, "rpcap://", 8) == 0) {
+            /* Remote capture via rpcapd - requires libpcap built with --enable-remote */
+            pcap_handle = pcap_open(input_pcap, 1600, PCAP_OPENFLAG_PROMISCUOUS,
+                                    100, NULL, errbuf);
+            if (!pcap_handle) {
+                log_fatal("pcap_open (rpcap) failed: %s", errbuf);
+                return 1;
+            }
+
+            /* Set BPF filter for HTTP/HTTPS/QUIC */
+            struct bpf_program fp;
+            if (pcap_compile(pcap_handle, &fp, "port 80 or port 443", 1, PCAP_NETMASK_UNKNOWN) == 0) {
+                pcap_setfilter(pcap_handle, &fp);
+                pcap_freecode(&fp);
+            }
+
+            log_info("Remote capture from %s...", input_pcap);
+        } else
+#else
+        if (strncmp(input_pcap, "rpcap://", 8) == 0) {
+            log_fatal("rpcap:// URLs require libpcap built with --enable-remote");
             return 1;
         }
-        log_info("Reading from %s...",
-                 strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap);
+#endif
+        {
+            /* Local file or stdin */
+            pcap_handle = pcap_open_offline(input_pcap, errbuf);
+            if (!pcap_handle) {
+                log_fatal("pcap_open_offline failed: %s", errbuf);
+                return 1;
+            }
+            log_info("Reading from %s...",
+                     strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap);
+        }
     } else {
         pcap_handle = pcap_open_live(interface, 1600, 1, 100, errbuf);
         if (!pcap_handle) {
