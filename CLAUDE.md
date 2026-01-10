@@ -165,6 +165,7 @@ Options:
   -u <user>    SSH user for remote router (default: root)
   -k <keyfile> SSH key file for remote router (uses default if omitted)
   -F <type>    Firewall type: 'nft' (nftables/fw4) or 'ipset' (iptables/fw3)
+  -L <file>    Log to file (in addition to stderr)
   -e           Enable enforcement mode (blocks via firewall)
   -V           Video-only mode (ignore social media browsing)
   -d           Debug mode (verbose output)
@@ -298,16 +299,30 @@ The Makefile automatically uses the local `nDPI/` build if present.
 
 ## Log Output
 
-```
-StreamGuard - Video Streaming Quota Enforcement
-Interface: eno1 | LAN: 192.168.0.0/255.255.255.0 | Quota: 3600 sec | ALL-SOCIAL | DRY-RUN
+All log messages include timestamps. Logging uses the [rxi/log.c](https://github.com/rxi/log.c) library (MIT license).
 
-[STREAMING] QUIC.YouTube | 192.168.0.10:54321 -> 142.250.1.1:443
-[STREAMING] TLS.Instagram | 192.168.0.10:54322 -> 157.240.1.1:443
-[SESSION_START] 192.168.0.10
-[SESSION_END] 192.168.0.10 | +120 sec | total: 2845/3600 sec (47.4 min, 79%)
-[BLOCKED] 192.168.0.10 (quota exceeded: 3612/3600 seconds)
-[RESET] 192.168.0.10: 3612 seconds -> 0 (new day: 2026-01-06)
+```
+14:32:15 INFO  streamguard.c:843: StreamGuard - Video Streaming Quota Enforcement
+14:32:15 INFO  streamguard.c:863: Interface: eno1 | LAN: 192.168.0.0/255.255.255.0 | Quota: 3600 sec | ALL-SOCIAL | DRY-RUN
+14:32:16 INFO  streamguard.c:654: STREAMING: QUIC.YouTube (UDP/Video) | 192.168.0.10:54321 -> 142.250.1.1:443 | host=www.youtube.com
+14:32:16 INFO  streamguard.c:673: SESSION_START: 192.168.0.10
+14:32:45 DEBUG streamguard.c:684: TLS (TCP/Web) | 192.168.0.10:42082 -> 185.125.190.49:80 | host=connectivity-check.ubuntu.com
+14:35:20 INFO  streamguard.c:521: SESSION_END: 192.168.0.10 | +120 sec | total: 2845/3600 sec (47.4 min, 79%)
+14:40:00 WARN  streamguard.c:230: BLOCKED: 192.168.0.10 (quota exceeded: 3612/3600 seconds)
+00:00:01 INFO  streamguard.c:380: RESET: 192.168.0.10: 3612 seconds -> 0 (new day: 2026-01-07)
+```
+
+### Log Levels
+- **INFO** - Normal operational messages (streaming detected, sessions, startup)
+- **WARN** - Important events (client blocked, quota exceeded)
+- **DEBUG** - Verbose protocol details (requires `-d` flag)
+- **ERROR** - Failures (firewall commands, pcap errors)
+- **FATAL** - Unrecoverable errors (startup failures)
+
+### Logging to File
+Use `-L` to log to a file in addition to stderr:
+```bash
+sudo ./streamguard -i eno1 -e -L /var/log/streamguard.log
 ```
 
 ## Known Issues

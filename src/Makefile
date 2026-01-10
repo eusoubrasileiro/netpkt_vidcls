@@ -16,18 +16,22 @@ CFLAGS = -Wall -Wextra -O2 $(NDPI_CFLAGS)
 LDFLAGS = $(NDPI_LIBS) -lpcap -lcjson
 
 TARGET = streamguard
-SRC = streamguard.c
+SRCS = streamguard.c log.c
+OBJS = streamguard.o log.o
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 debug: CFLAGS += -g -DDEBUG
 debug: $(TARGET)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(OBJS)
 
 install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/

@@ -26,6 +26,7 @@
 #include <cjson/cJSON.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include "log.h"
 
 /* For unit testing: expose internal functions when compiled with -DTESTING */
 #ifdef TESTING
@@ -104,6 +105,8 @@ static char *ssh_user = "root";     /* -u: SSH user (default: root) */
 static char *ssh_keyfile = NULL;    /* -k: SSH key path (optional) */
 static char *firewall_type = "nft"; /* -F: "nft" (nftables) or "ipset" (iptables) */
 static char *unblock_ip = NULL;     /* -U: IP to unblock and exit */
+static char *log_file_path = NULL;  /* -L: Log file path (optional) */
+static FILE *log_file_fp = NULL;    /* Log file pointer */
 
 /* Get current time - uses pcap timestamps when replaying, wall clock otherwise */
 static uint64_t get_current_time_ms(void) {
@@ -202,7 +205,7 @@ static int execute_firewall_command(const char *action, const char *set_name, co
         snprintf(cmd, sizeof(cmd), "%s", fw_cmd);
     }
 
-    if (debug_mode) printf("[DEBUG] Executing: %s\n", cmd);
+    log_debug("Executing: %s", cmd);
     return system(cmd);
 }
 
@@ -224,16 +227,16 @@ static void block_client(uint32_t client_ip) {
         int ret = execute_firewall_command("add", "blocked_streaming_clients", ip_str);
         if (ret == 0) {
             clients[idx].is_blocked = 1;
-            printf("[BLOCKED] %s (quota exceeded: %lu/%lu seconds)%s\n",
-                   ip_str, clients[idx].streaming_seconds, daily_quota,
-                   router_ip ? " [remote]" : "");
+            log_warn("BLOCKED: %s (quota exceeded: %lu/%lu seconds)%s",
+                     ip_str, clients[idx].streaming_seconds, daily_quota,
+                     router_ip ? " [remote]" : "");
         } else {
-            printf("[ERROR] Failed to block %s (%s returned %d)\n",
-                   ip_str, router_ip ? "SSH" : firewall_type, ret);
+            log_error("Failed to block %s (%s returned %d)",
+                      ip_str, router_ip ? "SSH" : firewall_type, ret);
         }
     } else {
-        printf("[DRY-RUN] Would block %s (quota exceeded: %lu/%lu seconds)\n",
-               ip_str, clients[idx].streaming_seconds, daily_quota);
+        log_info("DRY-RUN: Would block %s (quota exceeded: %lu/%lu seconds)",
+                 ip_str, clients[idx].streaming_seconds, daily_quota);
     }
 }
 
@@ -247,14 +250,14 @@ static void unblock_client(uint32_t client_ip) {
         int ret = execute_firewall_command("del", "blocked_streaming_clients", ip_str);
         if (ret == 0) {
             clients[idx].is_blocked = 0;
-            printf("[UNBLOCKED] %s (daily reset)%s\n",
-                   ip_str, router_ip ? " [remote]" : "");
+            log_info("UNBLOCKED: %s (daily reset)%s",
+                     ip_str, router_ip ? " [remote]" : "");
         } else {
-            printf("[ERROR] Failed to unblock %s (%s returned %d)\n",
-                   ip_str, router_ip ? "SSH" : firewall_type, ret);
+            log_error("Failed to unblock %s (%s returned %d)",
+                      ip_str, router_ip ? "SSH" : firewall_type, ret);
         }
     } else {
-        printf("[DRY-RUN] Would unblock %s (daily reset)\n", ip_str);
+        log_info("DRY-RUN: Would unblock %s (daily reset)", ip_str);
     }
 }
 
@@ -284,7 +287,7 @@ STATIC void save_state(void) {
         fputs(json_str, f);
         fclose(f);
     } else {
-        fprintf(stderr, "[WARN] Could not save state to %s: %s\n", state_file_path, strerror(errno));
+        log_warn("Could not save state to %s: %s", state_file_path, strerror(errno));
     }
 
     free(json_str);
@@ -298,7 +301,7 @@ STATIC void load_state(void) {
 
     FILE *f = fopen(state_file_path, "r");
     if (!f) {
-        printf("No previous state file found (%s), starting fresh\n", state_file_path);
+        log_info("No previous state file found (%s), starting fresh", state_file_path);
         return;
     }
 
@@ -319,7 +322,7 @@ STATIC void load_state(void) {
     free(json_str);
 
     if (!root) {
-        fprintf(stderr, "[WARN] Could not parse state file\n");
+        log_warn("Could not parse state file");
         return;
     }
 
@@ -358,7 +361,7 @@ STATIC void load_state(void) {
     }
 
     cJSON_Delete(root);
-    printf("Loaded state for %d clients from %s\n", loaded, state_file_path);
+    log_info("Loaded state for %d clients from %s", loaded, state_file_path);
 }
 
 /* Check if daily reset is needed */
@@ -374,8 +377,8 @@ static void check_daily_reset(void) {
             strcmp(clients[i].last_reset_date, today) != 0) {
 
             if (clients[i].streaming_seconds > 0) {
-                printf("[RESET] %s: %lu seconds -> 0 (new day: %s)\n",
-                       ip_to_str(clients[i].ip), clients[i].streaming_seconds, today);
+                log_info("RESET: %s: %lu seconds -> 0 (new day: %s)",
+                         ip_to_str(clients[i].ip), clients[i].streaming_seconds, today);
             }
 
             /* Unblock if was blocked */
@@ -475,8 +478,8 @@ static void expire_flows(void) {
         if (!f->in_use) continue;
 
         if ((now_ms - f->last_seen_ms) > (FLOW_IDLE_TIMEOUT * 1000)) {
-            /* Flow expired - log if debug mode and streaming category */
-            if (debug_mode && f->detection_completed && is_trackable_traffic(f->detected_protocol)) {
+            /* Flow expired - log if streaming category (debug level) */
+            if (f->detection_completed && is_trackable_traffic(f->detected_protocol)) {
                 char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
                 struct in_addr src_addr = { .s_addr = f->src_ip };
                 struct in_addr dst_addr = { .s_addr = f->dst_ip };
@@ -490,9 +493,9 @@ static void expire_flows(void) {
 
                 uint64_t bytes_per_sec = (duration_ms > 0) ? (f->bytes * 1000 / duration_ms) : 0;
 
-                printf("[FLOW_END] %s | %s:%d -> %s:%d | %lu bytes | %u sec | %lu KB/s\n",
-                       proto_name, src_str, ntohs(f->src_port),
-                       dst_str, ntohs(f->dst_port), f->bytes, duration_sec, bytes_per_sec / 1000);
+                log_debug("FLOW_END: %s | %s:%d -> %s:%d | %lu bytes | %u sec | %lu KB/s",
+                          proto_name, src_str, ntohs(f->src_port),
+                          dst_str, ntohs(f->dst_port), f->bytes, duration_sec, bytes_per_sec / 1000);
             }
             /* Note: Quota is now tracked via session-based timing, not flow duration */
             free_flow(f);
@@ -515,9 +518,9 @@ static void check_session_timeouts(void) {
             clients[i].streaming_seconds += duration_sec;
 
             double pct = (100.0 * clients[i].streaming_seconds) / daily_quota;
-            printf("[SESSION_END] %s | +%lu sec | total: %lu/%lu sec (%.1f min, %.0f%%)\n",
-                   ip_to_str(clients[i].ip), duration_sec, clients[i].streaming_seconds, daily_quota,
-                   clients[i].streaming_seconds / 60.0, pct);
+            log_info("SESSION_END: %s | +%lu sec | total: %lu/%lu sec (%.1f min, %.0f%%)",
+                     ip_to_str(clients[i].ip), duration_sec, clients[i].streaming_seconds, daily_quota,
+                     clients[i].streaming_seconds / 60.0, pct);
 
             clients[i].session_start_ms = 0;  /* Reset session */
 
@@ -536,8 +539,8 @@ static void check_session_timeouts(void) {
                 clients[i].streaming_seconds = effective_time;
                 clients[i].session_start_ms = now_ms;  /* Reset to avoid double-counting */
 
-                printf("[QUOTA_EXCEEDED] %s | %lu/%lu sec (blocked during active session)\n",
-                       ip_to_str(clients[i].ip), clients[i].streaming_seconds, daily_quota);
+                log_warn("QUOTA_EXCEEDED: %s | %lu/%lu sec (blocked during active session)",
+                         ip_to_str(clients[i].ip), clients[i].streaming_seconds, daily_quota);
                 block_client(clients[i].ip);
             }
         }
@@ -648,9 +651,9 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
 
             /* Log new streaming flow */
             if (is_trackable_traffic(flow->detected_protocol)) {
-                printf("[STREAMING] %s (%s/%s) | %s:%d -> %s:%d | host=%s\n",
-                       proto_name, proto_transport, cat_name, src_str, ntohs(src_port),
-                       dst_str, ntohs(dst_port), host);
+                log_info("STREAMING: %s (%s/%s) | %s:%d -> %s:%d | host=%s",
+                         proto_name, proto_transport, cat_name, src_str, ntohs(src_port),
+                         dst_str, ntohs(dst_port), host);
 
                 /* Add streaming destination to router's nftables set */
                 uint32_t stream_dst = is_lan_ip(src_ip) ? dst_ip : src_ip;
@@ -667,7 +670,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
                 if (clients[idx].session_start_ms == 0) {
                     /* New streaming session starting */
                     clients[idx].session_start_ms = now_ms;
-                    printf("[SESSION_START] %s\n", ip_to_str(client_ip));
+                    log_info("SESSION_START: %s", ip_to_str(client_ip));
 
                     /* Set today's date if not set */
                     if (clients[idx].last_reset_date[0] == '\0') {
@@ -676,11 +679,11 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
                     }
                 }
                 clients[idx].last_streaming_activity_ms = now_ms;
-            } else if (debug_mode && flow->detected_protocol.proto.app_protocol != NDPI_PROTOCOL_UNKNOWN) {
+            } else if (flow->detected_protocol.proto.app_protocol != NDPI_PROTOCOL_UNKNOWN) {
                 /* Debug: log non-streaming detected protocols */
-                printf("[DEBUG] %s (%s/%s) | %s:%d -> %s:%d | host=%s\n",
-                       proto_name, proto_transport, cat_name, src_str, ntohs(src_port),
-                       dst_str, ntohs(dst_port), host);
+                log_debug("%s (%s/%s) | %s:%d -> %s:%d | host=%s",
+                          proto_name, proto_transport, cat_name, src_str, ntohs(src_port),
+                          dst_str, ntohs(dst_port), host);
             }
         }
     }
@@ -718,6 +721,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -k <keyfile> SSH key file for remote router (uses default if omitted)\n");
     fprintf(stderr, "  -F <type>    Firewall type: 'nft' (nftables/fw4) or 'ipset' (iptables/fw3)\n");
     fprintf(stderr, "  -U <ip>      Unblock a client IP and exit (requires -R)\n");
+    fprintf(stderr, "  -L <file>    Log to file (in addition to stderr)\n");
     fprintf(stderr, "  -e           Enable enforcement mode (add blocked IPs to firewall)\n");
     fprintf(stderr, "  -V           Video-only mode (ignore social media browsing)\n");
     fprintf(stderr, "  -d           Enable debug mode (verbose protocol logging)\n");
@@ -785,7 +789,7 @@ int main(int argc, char *argv[]) {
     char errbuf[PCAP_ERRBUF_SIZE];
     int opt;
 
-    while ((opt = getopt(argc, argv, "i:r:s:m:q:f:R:u:k:F:U:eVdh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:r:s:m:q:f:R:u:k:F:U:L:eVdh")) != -1) {
         switch (opt) {
             case 'i': interface = optarg; break;
             case 'r': input_pcap = optarg; break;
@@ -798,6 +802,7 @@ int main(int argc, char *argv[]) {
             case 'k': ssh_keyfile = optarg; break;
             case 'F': firewall_type = optarg; break;
             case 'U': unblock_ip = optarg; break;
+            case 'L': log_file_path = optarg; break;
             case 'e': enforce_mode = 1; break;
             case 'V': video_only_mode = 1; break;
             case 'd': debug_mode = 1; break;
@@ -806,15 +811,27 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Initialize logger */
+    log_set_level(debug_mode ? LOG_DEBUG : LOG_INFO);
+    if (log_file_path) {
+        log_file_fp = fopen(log_file_path, "a");
+        if (log_file_fp) {
+            log_add_fp(log_file_fp, LOG_TRACE);  /* All levels to file */
+        } else {
+            fprintf(stderr, "Warning: Could not open log file %s: %s\n",
+                    log_file_path, strerror(errno));
+        }
+    }
+
     /* Handle unblock mode - unblock IP and exit */
     if (unblock_ip != NULL) {
         if (router_ip == NULL) {
-            fprintf(stderr, "Error: -U requires -R (router IP)\n");
+            log_fatal("-U requires -R (router IP)");
             return 1;
         }
         struct in_addr addr;
         if (inet_pton(AF_INET, unblock_ip, &addr) != 1) {
-            fprintf(stderr, "Invalid IP address: %s\n", unblock_ip);
+            log_fatal("Invalid IP address: %s", unblock_ip);
             return 1;
         }
         enforce_mode = 1;  /* Enable to actually run command */
@@ -828,7 +845,7 @@ int main(int argc, char *argv[]) {
 
     if (!interface && !input_pcap) usage(argv[0]);
     if (interface && input_pcap) {
-        fprintf(stderr, "Error: Cannot use both -i and -r\n");
+        log_fatal("Cannot use both -i and -r");
         usage(argv[0]);
     }
 
@@ -837,32 +854,41 @@ int main(int argc, char *argv[]) {
     inet_pton(AF_INET, mask, &lan_netmask);
     lan_network &= lan_netmask;
 
-    printf("StreamGuard - Video Streaming Quota Enforcement\n");
+    log_info("StreamGuard - Video Streaming Quota Enforcement");
     const char *tracking_mode = video_only_mode ? "VIDEO-ONLY" : "ALL-SOCIAL";
     const char *exec_mode = enforce_mode ? "ENFORCE" : "DRY-RUN";
     if (input_pcap) {
-        printf("Input: %s | LAN: %s/%s | Quota: %lu sec | %s | %s",
-               strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap,
-               subnet, mask, daily_quota, tracking_mode, exec_mode);
+        if (router_ip) {
+            log_info("Input: %s | LAN: %s/%s | Quota: %lu sec | %s | %s | Router: %s@%s (%s)",
+                     strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap,
+                     subnet, mask, daily_quota, tracking_mode, exec_mode,
+                     ssh_user, router_ip, firewall_type);
+        } else {
+            log_info("Input: %s | LAN: %s/%s | Quota: %lu sec | %s | %s",
+                     strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap,
+                     subnet, mask, daily_quota, tracking_mode, exec_mode);
+        }
     } else {
-        printf("Interface: %s | LAN: %s/%s | Quota: %lu sec | %s | %s",
-               interface, subnet, mask, daily_quota, tracking_mode, exec_mode);
+        if (router_ip) {
+            log_info("Interface: %s | LAN: %s/%s | Quota: %lu sec | %s | %s | Router: %s@%s (%s)",
+                     interface, subnet, mask, daily_quota, tracking_mode, exec_mode,
+                     ssh_user, router_ip, firewall_type);
+        } else {
+            log_info("Interface: %s | LAN: %s/%s | Quota: %lu sec | %s | %s",
+                     interface, subnet, mask, daily_quota, tracking_mode, exec_mode);
+        }
     }
-    if (router_ip) {
-        printf(" | Router: %s@%s (%s)", ssh_user, router_ip, firewall_type);
-    }
-    printf("\n\n");
 
     /* Initialize nDPI (5.0 API - all protocols enabled by default) */
     ndpi_module = ndpi_init_detection_module(NULL);
     if (!ndpi_module) {
-        fprintf(stderr, "Failed to initialize nDPI\n");
+        log_fatal("Failed to initialize nDPI");
         return 1;
     }
 
     ndpi_finalize_initialization(ndpi_module);
 
-    printf("nDPI initialized (version %s)\n", ndpi_revision());
+    log_info("nDPI initialized (version %s)", ndpi_revision());
 
     /* Load previous state and check for daily reset */
     load_state();
@@ -872,15 +898,15 @@ int main(int argc, char *argv[]) {
     if (input_pcap) {
         pcap_handle = pcap_open_offline(input_pcap, errbuf);
         if (!pcap_handle) {
-            fprintf(stderr, "pcap_open_offline failed: %s\n", errbuf);
+            log_fatal("pcap_open_offline failed: %s", errbuf);
             return 1;
         }
-        printf("Reading from %s...\n\n",
-               strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap);
+        log_info("Reading from %s...",
+                 strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap);
     } else {
         pcap_handle = pcap_open_live(interface, 1600, 1, 100, errbuf);
         if (!pcap_handle) {
-            fprintf(stderr, "pcap_open_live failed: %s\n", errbuf);
+            log_fatal("pcap_open_live failed: %s", errbuf);
             return 1;
         }
 
@@ -891,7 +917,7 @@ int main(int argc, char *argv[]) {
             pcap_freecode(&fp);
         }
 
-        printf("Capturing on %s... Press Ctrl+C to stop\n\n", interface);
+        log_info("Capturing on %s... Press Ctrl+C to stop", interface);
     }
 
     /* Setup signal handlers */
@@ -915,7 +941,7 @@ int main(int argc, char *argv[]) {
             /* End of pcap file */
             break;
         } else if (ret == -1) {
-            fprintf(stderr, "pcap error: %s\n", pcap_geterr(pcap_handle));
+            log_error("pcap error: %s", pcap_geterr(pcap_handle));
             break;
         }
 
@@ -936,7 +962,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("\nShutting down...\n");
+    log_info("Shutting down...");
 
     /* End any active streaming sessions */
     uint64_t now_ms = get_current_time_ms();
@@ -947,8 +973,8 @@ int main(int argc, char *argv[]) {
                 (now_ms - clients[i].session_start_ms) / 1000;
             clients[i].streaming_seconds += duration_sec;
 
-            printf("[SESSION_END] %s | +%lu sec (shutdown) | total: %lu sec\n",
-                   ip_to_str(clients[i].ip), duration_sec, clients[i].streaming_seconds);
+            log_info("SESSION_END: %s | +%lu sec (shutdown) | total: %lu sec",
+                     ip_to_str(clients[i].ip), duration_sec, clients[i].streaming_seconds);
 
             clients[i].session_start_ms = 0;
         }
@@ -966,18 +992,19 @@ int main(int argc, char *argv[]) {
     expire_flows();
 
     /* Print final quotas */
-    printf("\n=== Final Quota Summary ===\n");
+    log_info("=== Final Quota Summary ===");
     for (int i = 0; i < 256; i++) {
         if (clients[i].in_use) {
-            printf("%s: %lu seconds (%.1f minutes)\n",
-                   ip_to_str(clients[i].ip), clients[i].streaming_seconds,
-                   clients[i].streaming_seconds / 60.0);
+            log_info("%s: %lu seconds (%.1f minutes)",
+                     ip_to_str(clients[i].ip), clients[i].streaming_seconds,
+                     clients[i].streaming_seconds / 60.0);
         }
     }
 
     /* Cleanup */
     pcap_close(pcap_handle);
     ndpi_exit_detection_module(ndpi_module);
+    if (log_file_fp) fclose(log_file_fp);
 
     return 0;
 }
