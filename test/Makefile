@@ -26,6 +26,17 @@ LOG_SRC = ../src/log.c
 LOG_OBJ = log_test.o
 FLOW_TABLE_SRC = ../src/flow_table.c
 FLOW_TABLE_OBJ = flow_table.o
+DETECTION_SRC = ../src/detection.c
+DETECTION_OBJ = detection.o
+FIREWALL_SRC = ../src/firewall.c
+FIREWALL_OBJ = firewall.o
+STATE_SRC = ../src/state.c
+STATE_OBJ = state.o
+CLIENT_QUOTA_SRC = ../src/client_quota.c
+CLIENT_QUOTA_OBJ = client_quota.o
+
+# All module objects
+MODULE_OBJS = $(FLOW_TABLE_OBJ) $(DETECTION_OBJ) $(FIREWALL_OBJ) $(STATE_OBJ) $(CLIENT_QUOTA_OBJ)
 
 # Unit test files
 UNIT_SRCS = $(wildcard unit/*.c)
@@ -47,9 +58,25 @@ $(LOG_OBJ): $(LOG_SRC)
 $(FLOW_TABLE_OBJ): $(FLOW_TABLE_SRC)
 	$(CC) $(CFLAGS) -I../src -c -o $@ $<
 
+# Build detection.c as object file
+$(DETECTION_OBJ): $(DETECTION_SRC)
+	$(CC) $(CFLAGS) -I../src -c -o $@ $<
+
+# Build firewall.c as object file
+$(FIREWALL_OBJ): $(FIREWALL_SRC)
+	$(CC) $(CFLAGS) -I../src -c -o $@ $<
+
+# Build state.c as object file
+$(STATE_OBJ): $(STATE_SRC)
+	$(CC) $(CFLAGS) -I../src -c -o $@ $<
+
+# Build client_quota.c as object file
+$(CLIENT_QUOTA_OBJ): $(CLIENT_QUOTA_SRC)
+	$(CC) $(CFLAGS) -I../src -c -o $@ $<
+
 # Build each unit test binary
-unit/%: unit/%.c $(STREAMGUARD_OBJ) $(LOG_OBJ) $(FLOW_TABLE_OBJ)
-	$(CC) $(CFLAGS) -I../src -o $@ $< $(STREAMGUARD_OBJ) $(LOG_OBJ) $(FLOW_TABLE_OBJ) $(LDFLAGS)
+unit/%: unit/%.c $(STREAMGUARD_OBJ) $(LOG_OBJ) $(MODULE_OBJS)
+	$(CC) $(CFLAGS) -I../src -o $@ $< $(STREAMGUARD_OBJ) $(LOG_OBJ) $(MODULE_OBJS) $(LDFLAGS)
 
 # Build all unit tests
 unit: $(UNIT_BINS)
@@ -80,4 +107,4 @@ tap: unit
 	done
 
 clean:
-	rm -f $(STREAMGUARD_OBJ) $(LOG_OBJ) $(FLOW_TABLE_OBJ) $(UNIT_BINS)
+	rm -f $(STREAMGUARD_OBJ) $(LOG_OBJ) $(MODULE_OBJS) $(UNIT_BINS)

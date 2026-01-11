@@ -26,8 +26,8 @@ CFLAGS = -Wall -Wextra -O2 $(NDPI_CFLAGS) $(PCAP_CFLAGS)
 LDFLAGS = $(NDPI_LIBS) $(PCAP_LIBS) -lcjson
 
 TARGET = streamguard
-SRCS = streamguard.c log.c flow_table.c
-OBJS = streamguard.o log.o flow_table.o
+SRCS = streamguard.c log.c flow_table.c detection.c firewall.c state.c client_quota.c
+OBJS = streamguard.o log.o flow_table.o detection.o firewall.o state.o client_quota.o
 
 all: $(TARGET)
 

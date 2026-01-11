@@ -35,6 +35,10 @@
 #include <errno.h>
 #include "log.h"
 #include "streamguard.h"
+#include "detection.h"
+#include "firewall.h"
+#include "state.h"
+#include "client_quota.h"
 
 /* For unit testing: expose internal functions when compiled with -DTESTING */
 #ifdef TESTING
@@ -77,6 +81,16 @@ void streamguard_ctx_free(struct streamguard_ctx *ctx) {
     /* Note: pcap_handle and ndpi_module are freed in main() */
 }
 
+/* Get firewall config from global context - defined before macros */
+static struct firewall_config get_firewall_config(void) {
+    struct firewall_config cfg;
+    cfg.fw_router_ip = g_ctx.router_ip;
+    cfg.fw_ssh_user = g_ctx.ssh_user;
+    cfg.fw_ssh_keyfile = g_ctx.ssh_keyfile;
+    cfg.fw_type = g_ctx.firewall_type;
+    return cfg;
+}
+
 /* Globals - aliased to context for backward compatibility during migration */
 #define ndpi_module     (g_ctx.ndpi_module)
 #define g_flow_table    (g_ctx.flow_table)
@@ -111,30 +125,19 @@ static uint64_t get_packet_time_ms(void) {
     return get_wall_time_ms();
 }
 
-/* Check if protocol is a social media platform (Instagram, Facebook) */
+/* Wrapper for detection module - exposed for testing via STATIC macro */
 STATIC int is_social_media_protocol(ndpi_protocol proto) {
-    uint16_t app = proto.proto.app_protocol;
-    return (app == NDPI_PROTOCOL_INSTAGRAM ||
-            app == NDPI_PROTOCOL_FACEBOOK ||
-            app == NDPI_PROTOCOL_FACEBOOK_REEL_STORY);
+    return det_is_social_media_protocol(proto);
 }
 
-/* Check if traffic should be tracked for quota
- * Default: VIDEO/STREAMING/MEDIA categories + social media (Instagram, Facebook)
- * Video-only mode (-V): Only VIDEO/STREAMING/MEDIA categories
- */
+/* Wrapper for detection module - uses global video_only_mode */
 STATIC int is_trackable_traffic(ndpi_protocol proto) {
-    /* Always track pure video/streaming categories */
-    if (proto.category == NDPI_PROTOCOL_CATEGORY_VIDEO ||
-        proto.category == NDPI_PROTOCOL_CATEGORY_STREAMING ||
-        proto.category == NDPI_PROTOCOL_CATEGORY_MEDIA) {
-        return 1;
-    }
-    /* Track social media unless in video-only mode */
-    if (!video_only_mode && is_social_media_protocol(proto)) {
-        return 1;
-    }
-    return 0;
+    return det_is_trackable_traffic(proto, video_only_mode);
+}
+
+/* Local wrapper that calls is_trackable_traffic */
+static int is_trackable(ndpi_protocol proto) {
+    return is_trackable_traffic(proto);
 }
 
 /* Check if IP is in LAN */
@@ -168,46 +171,10 @@ static void get_current_date(char *buf, size_t len) {
     strftime(buf, len, "%Y-%m-%d", tm);
 }
 
-/* Execute firewall command via SSH (if router configured) or locally
- * Supports both nftables (fw4) and iptables/ipset (fw3) based on firewall_type
- * action: "add" or "del"
- * set_name: e.g., "blocked_streaming_clients" or "streaming_destinations"
- * ip: IP address to add/remove
- */
-static int execute_firewall_command(const char *action, const char *set_name, const char *ip) {
-    char fw_cmd[256];
-    char cmd[512];
-
-    /* Build firewall-specific command */
-    if (strcmp(firewall_type, "ipset") == 0) {
-        /* iptables/ipset (fw3): ipset add/del set_name IP */
-        snprintf(fw_cmd, sizeof(fw_cmd), "ipset %s %s %s 2>/dev/null",
-                 action, set_name, ip);
-    } else {
-        /* nftables (fw4): nft add/delete element inet fw4 set_name '{ IP }' */
-        const char *nft_action = (strcmp(action, "add") == 0) ? "add" : "delete";
-        snprintf(fw_cmd, sizeof(fw_cmd),
-                 "nft %s element inet fw4 %s '{ %s }' 2>/dev/null",
-                 nft_action, set_name, ip);
-    }
-
-    /* Wrap with SSH if remote router configured */
-    if (router_ip != NULL) {
-        if (ssh_keyfile != NULL) {
-            snprintf(cmd, sizeof(cmd),
-                "ssh -o ConnectTimeout=5 -o BatchMode=yes -i %s %s@%s \"%s\"",
-                ssh_keyfile, ssh_user, router_ip, fw_cmd);
-        } else {
-            snprintf(cmd, sizeof(cmd),
-                "ssh -o ConnectTimeout=5 -o BatchMode=yes %s@%s \"%s\"",
-                ssh_user, router_ip, fw_cmd);
-        }
-    } else {
-        snprintf(cmd, sizeof(cmd), "%s", fw_cmd);
-    }
-
-    log_debug("Executing: %s", cmd);
-    return system(cmd);
+/* Execute firewall command - wrapper around firewall module */
+static int execute_firewall_command(const char *action, const char *set_name, const char *ip_str) {
+    struct firewall_config cfg = get_firewall_config();
+    return firewall_execute(&cfg, action, set_name, ip_str);
 }
 
 /* Add streaming destination IP to router's firewall set */
@@ -299,107 +266,14 @@ static void retry_pending_blocks(void) {
     }
 }
 
-/* Save state to JSON file (only if -f specified) */
+/* Save state to JSON file - wrapper around state module */
 STATIC void save_state(void) {
-    if (!state_file_path) return;  /* State persistence disabled */
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON *clients_arr = cJSON_CreateArray();
-
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (!clients[i].in_use) continue;
-
-        cJSON *client = cJSON_CreateObject();
-        cJSON_AddStringToObject(client, "ip", ip_to_str(clients[i].ip));
-        cJSON_AddNumberToObject(client, "streaming_seconds", clients[i].streaming_seconds);
-        cJSON_AddStringToObject(client, "last_reset_date", clients[i].last_reset_date);
-        cJSON_AddBoolToObject(client, "is_blocked", clients[i].is_blocked);
-        cJSON_AddItemToArray(clients_arr, client);
-    }
-
-    cJSON_AddItemToObject(root, "clients", clients_arr);
-
-    char *json_str = cJSON_Print(root);
-    FILE *f = fopen(state_file_path, "w");
-    if (f) {
-        fputs(json_str, f);
-        fclose(f);
-    } else {
-        log_warn("Could not save state to %s: %s", state_file_path, strerror(errno));
-    }
-
-    free(json_str);
-    cJSON_Delete(root);
-    last_state_save = time(NULL);
+    state_save(clients, MAX_CLIENTS, state_file_path, &last_state_save);
 }
 
-/* Load state from JSON file (only if -f specified) */
+/* Load state from JSON file - wrapper around state module */
 STATIC void load_state(void) {
-    if (!state_file_path) return;  /* State persistence disabled */
-
-    FILE *f = fopen(state_file_path, "r");
-    if (!f) {
-        log_info("No previous state file found (%s), starting fresh", state_file_path);
-        return;
-    }
-
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    char *json_str = malloc(fsize + 1);
-    if (!json_str) {
-        fclose(f);
-        return;
-    }
-    size_t bytes_read = fread(json_str, 1, fsize, f);
-    json_str[bytes_read] = '\0';
-    fclose(f);
-
-    cJSON *root = cJSON_Parse(json_str);
-    free(json_str);
-
-    if (!root) {
-        log_warn("Could not parse state file");
-        return;
-    }
-
-    cJSON *clients_arr = cJSON_GetObjectItem(root, "clients");
-    if (!cJSON_IsArray(clients_arr)) {
-        cJSON_Delete(root);
-        return;
-    }
-
-    int loaded = 0;
-    cJSON *client;
-    cJSON_ArrayForEach(client, clients_arr) {
-        cJSON *ip_json = cJSON_GetObjectItem(client, "ip");
-        cJSON *seconds_json = cJSON_GetObjectItem(client, "streaming_seconds");
-        cJSON *date_json = cJSON_GetObjectItem(client, "last_reset_date");
-        cJSON *blocked_json = cJSON_GetObjectItem(client, "is_blocked");
-
-        if (!cJSON_IsString(ip_json) || !cJSON_IsNumber(seconds_json)) continue;
-
-        struct in_addr addr;
-        if (inet_pton(AF_INET, ip_json->valuestring, &addr) != 1) continue;
-
-        int idx = get_client_index(addr.s_addr);
-        clients[idx].ip = addr.s_addr;
-        clients[idx].streaming_seconds = (uint64_t)seconds_json->valuedouble;
-        clients[idx].in_use = 1;
-
-        if (cJSON_IsString(date_json)) {
-            snprintf(clients[idx].last_reset_date,
-                     sizeof(clients[idx].last_reset_date), "%s", date_json->valuestring);
-        }
-        if (cJSON_IsBool(blocked_json)) {
-            clients[idx].is_blocked = cJSON_IsTrue(blocked_json);
-        }
-        loaded++;
-    }
-
-    cJSON_Delete(root);
-    log_info("Loaded state for %d clients from %s", loaded, state_file_path);
+    state_load(clients, MAX_CLIENTS, state_file_path, get_client_index);
 }
 
 /* Check if daily reset is needed */
@@ -467,7 +341,7 @@ static void on_flow_expire(struct flow_entry *f, void *user_data) {
     (void)user_data;
 
     /* Log if streaming category (debug level) */
-    if (f->detection_completed && is_trackable_traffic(f->detected_protocol)) {
+    if (f->detection_completed && is_trackable(f->detected_protocol)) {
         char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
         struct in_addr src_addr = { .s_addr = f->src_ip };
         struct in_addr dst_addr = { .s_addr = f->dst_ip };
@@ -652,7 +526,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
                                ? (const char *)flow->ndpi_flow->host_server_name : "(none)";
 
             /* Log new streaming flow */
-            if (is_trackable_traffic(flow->detected_protocol)) {
+            if (is_trackable(flow->detected_protocol)) {
                 log_info("STREAMING: %s (%s/%s) | %s:%d -> %s:%d | host=%s",
                          proto_name, proto_transport, cat_name, src_str, ntohs(src_port),
                          dst_str, ntohs(dst_port), host);
@@ -691,7 +565,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
     }
 
     /* Update session activity for ongoing streaming flows */
-    if (flow->detection_completed && is_trackable_traffic(flow->detected_protocol)) {
+    if (flow->detection_completed && is_trackable(flow->detected_protocol)) {
         uint32_t client_ip = is_lan_ip(flow->src_ip) ? flow->src_ip : flow->dst_ip;
         int idx = get_client_index(client_ip);
         if (clients[idx].session_start_ms != 0) {
