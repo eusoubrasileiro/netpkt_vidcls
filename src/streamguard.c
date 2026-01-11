@@ -34,6 +34,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include "log.h"
+#include "streamguard.h"
 
 /* For unit testing: expose internal functions when compiled with -DTESTING */
 #ifdef TESTING
@@ -42,52 +43,6 @@
 #define STATIC static
 #endif
 
-#define MAX_FLOWS 65536
-#define SAVE_INTERVAL 60  /* seconds */
-#define FLOW_IDLE_TIMEOUT 30  /* seconds */
-#define SESSION_TIMEOUT 45000  /* 45 seconds - based on YouTube's ~30s buffer */
-#define BLOCK_INITIAL_BACKOFF_MS  5000    /* 5 sec initial retry */
-#define BLOCK_MAX_BACKOFF_MS      300000  /* 5 min max backoff */
-#define NEXT_BACKOFF(b) ((b) * 2 > BLOCK_MAX_BACKOFF_MS ? BLOCK_MAX_BACKOFF_MS : (b) * 2)
-#define LAN_SUBNET "192.168.0.0"
-#define LAN_MASK "255.255.255.0"
-
-/* Flow tracking structure */
-struct flow_info {
-    uint32_t src_ip;
-    uint32_t dst_ip;
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint8_t protocol;
-
-    struct ndpi_flow_struct *ndpi_flow;
-
-    ndpi_protocol detected_protocol;
-    uint8_t detection_completed;
-
-    uint64_t bytes;
-    uint32_t packets;
-    uint64_t first_seen_ms;  /* milliseconds */
-    uint64_t last_seen_ms;   /* milliseconds */
-
-    uint8_t in_use;
-};
-
-/* Client tracking for quota */
-struct client_info {
-    uint32_t ip;
-    uint64_t streaming_seconds;
-    char last_reset_date[16];  /* YYYY-MM-DD */
-    uint8_t in_use;
-    uint8_t is_blocked;
-    /* Session-based tracking */
-    uint64_t session_start_ms;          /* When current session started (0 = inactive) */
-    uint64_t last_streaming_activity_ms; /* Last streaming packet timestamp */
-    /* Block retry with exponential backoff */
-    uint64_t block_retry_after_ms;      /* 0 = no retry needed, >0 = retry at this time */
-    uint32_t block_backoff_ms;          /* Current backoff (doubles each failure) */
-};
-
 /* Get current time in milliseconds (wall clock) */
 static uint64_t get_wall_time_ms(void) {
     struct timespec ts;
@@ -95,31 +50,58 @@ static uint64_t get_wall_time_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* Globals */
-static struct ndpi_detection_module_struct *ndpi_module = NULL;
-static struct flow_info flows[MAX_FLOWS];
-static struct client_info clients[256];  /* /24 subnet */
-static pcap_t *pcap_handle = NULL;
-static volatile int running = 1;
-static uint32_t lan_network;
-static uint32_t lan_netmask;
-static int enforce_mode = 0;  /* 0=dry-run, 1=enforce */
-static int debug_mode = 0;   /* 0=normal, 1=verbose debug output */
-static int video_only_mode = 0;  /* 0=all social media, 1=video streaming only */
-static uint64_t daily_quota = 3600;  /* seconds */
-static time_t last_state_save = 0;
-static char *state_file_path = NULL;
-static char *input_pcap = NULL;  /* Read from file instead of live capture */
-static uint64_t pcap_time_ms = 0;  /* Current time from pcap timestamps (for replay mode) */
+/* Global context instance */
+static struct streamguard_ctx g_ctx;
 
-/* Remote router configuration for SSH-based blocking */
-static char *router_ip = NULL;      /* -R: Router IP for SSH commands */
-static char *ssh_user = "root";     /* -u: SSH user (default: root) */
-static char *ssh_keyfile = NULL;    /* -k: SSH key path (optional) */
-static char *firewall_type = "nft"; /* -F: "nft" (nftables) or "ipset" (iptables) */
+/* Initialize context with default values */
+void streamguard_ctx_init(struct streamguard_ctx *ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->running = 1;
+    ctx->daily_quota = 3600;  /* 1 hour default */
+    ctx->ssh_user = "root";
+    ctx->firewall_type = "nft";
+    flow_table_init(&ctx->flow_table);
+}
+
+/* Free context resources */
+void streamguard_ctx_free(struct streamguard_ctx *ctx) {
+    /* Free flow table (uthash-based) */
+    flow_table_free(&ctx->flow_table);
+
+    /* Close log file if open */
+    if (ctx->log_file_fp) {
+        fclose(ctx->log_file_fp);
+        ctx->log_file_fp = NULL;
+    }
+
+    /* Note: pcap_handle and ndpi_module are freed in main() */
+}
+
+/* Globals - aliased to context for backward compatibility during migration */
+#define ndpi_module     (g_ctx.ndpi_module)
+#define g_flow_table    (g_ctx.flow_table)
+#define clients         (g_ctx.clients)
+#define pcap_handle     (g_ctx.pcap_handle)
+#define running         (g_ctx.running)
+#define lan_network     (g_ctx.lan_network)
+#define lan_netmask     (g_ctx.lan_netmask)
+#define enforce_mode    (g_ctx.enforce_mode)
+#define debug_mode      (g_ctx.debug_mode)
+#define video_only_mode (g_ctx.video_only_mode)
+#define daily_quota     (g_ctx.daily_quota)
+#define last_state_save (g_ctx.last_state_save)
+#define state_file_path (g_ctx.state_file_path)
+#define input_pcap      (g_ctx.input_pcap)
+#define pcap_time_ms    (g_ctx.pcap_time_ms)
+#define router_ip       (g_ctx.router_ip)
+#define ssh_user        (g_ctx.ssh_user)
+#define ssh_keyfile     (g_ctx.ssh_keyfile)
+#define firewall_type   (g_ctx.firewall_type)
+#define log_file_path   (g_ctx.log_file_path)
+#define log_file_fp     (g_ctx.log_file_fp)
+
+/* Not part of context - CLI argument only */
 static char *unblock_ip = NULL;     /* -U: IP to unblock and exit */
-static char *log_file_path = NULL;  /* -L: Log file path (optional) */
-static FILE *log_file_fp = NULL;    /* Log file pointer */
 
 /* Get current time - uses pcap timestamps when replaying, wall clock otherwise */
 static uint64_t get_packet_time_ms(void) {
@@ -293,7 +275,7 @@ static void unblock_client(uint32_t client_ip) {
 static void retry_pending_blocks(void) {
     uint64_t now_ms = get_wall_time_ms();
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].in_use || !clients[i].is_blocked) continue;
         if (clients[i].block_retry_after_ms == 0) continue;  /* Already blocked */
         if (now_ms < clients[i].block_retry_after_ms) continue;  /* Not time yet */
@@ -324,7 +306,7 @@ STATIC void save_state(void) {
     cJSON *root = cJSON_CreateObject();
     cJSON *clients_arr = cJSON_CreateArray();
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].in_use) continue;
 
         cJSON *client = cJSON_CreateObject();
@@ -425,7 +407,7 @@ static void check_daily_reset(void) {
     char today[16];
     get_current_date(today, sizeof(today));
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].in_use) continue;
 
         /* If last_reset_date is empty or different from today, reset */
@@ -468,102 +450,56 @@ STATIC uint32_t flow_hash(uint32_t src_ip, uint32_t dst_ip,
     return hash % MAX_FLOWS;
 }
 
-/* Find or create flow */
-static struct flow_info *get_flow(uint32_t src_ip, uint32_t dst_ip,
+/* Find or create flow - wrapper around flow_table API */
+static struct flow_entry *get_flow(uint32_t src_ip, uint32_t dst_ip,
                                    uint16_t src_port, uint16_t dst_port,
                                    uint8_t protocol, int *is_new) {
-    /* Normalize so both directions use same flow entry */
-    uint32_t norm_ip1 = src_ip, norm_ip2 = dst_ip;
-    uint16_t norm_port1 = src_port, norm_port2 = dst_port;
-    normalize_flow_key(&norm_ip1, &norm_ip2, &norm_port1, &norm_port2);
-
-    uint32_t idx = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
-    uint32_t start_idx = idx;
-    *is_new = 0;
-
-    /* Linear probing */
-    do {
-        struct flow_info *f = &flows[idx];
-
-        if (!f->in_use) {
-            /* New flow - store normalized */
-            memset(f, 0, sizeof(*f));
-            f->src_ip = norm_ip1;
-            f->dst_ip = norm_ip2;
-            f->src_port = norm_port1;
-            f->dst_port = norm_port2;
-            f->protocol = protocol;
-            f->first_seen_ms = get_packet_time_ms();
-            f->last_seen_ms = f->first_seen_ms;
-            f->in_use = 1;
-
-            /* Allocate nDPI flow structure */
-            f->ndpi_flow = ndpi_flow_malloc(SIZEOF_FLOW_STRUCT);
-            if (f->ndpi_flow) memset(f->ndpi_flow, 0, SIZEOF_FLOW_STRUCT);
-
-            *is_new = 1;
-            return f;
-        }
-
-        /* Check if this is our flow (already normalized) */
-        if (f->src_ip == norm_ip1 && f->dst_ip == norm_ip2 &&
-            f->src_port == norm_port1 && f->dst_port == norm_port2 &&
-            f->protocol == protocol) {
-            f->last_seen_ms = get_packet_time_ms();
-            return f;
-        }
-
-        idx = (idx + 1) % MAX_FLOWS;
-    } while (idx != start_idx);
-
-    return NULL;  /* Table full */
+    return flow_table_find_or_create(&g_flow_table,
+                                     src_ip, dst_ip,
+                                     src_port, dst_port,
+                                     protocol,
+                                     get_packet_time_ms(),
+                                     is_new);
 }
 
-/* Free flow resources */
-static void free_flow(struct flow_info *f) {
-    if (f->ndpi_flow) ndpi_flow_free(f->ndpi_flow);
-    memset(f, 0, sizeof(*f));
+/* Callback for flow expiration - logs streaming flows */
+static void on_flow_expire(struct flow_entry *f, void *user_data) {
+    (void)user_data;
+
+    /* Log if streaming category (debug level) */
+    if (f->detection_completed && is_trackable_traffic(f->detected_protocol)) {
+        char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
+        struct in_addr src_addr = { .s_addr = f->src_ip };
+        struct in_addr dst_addr = { .s_addr = f->dst_ip };
+        inet_ntop(AF_INET, &src_addr, src_str, sizeof(src_str));
+        inet_ntop(AF_INET, &dst_addr, dst_str, sizeof(dst_str));
+
+        uint64_t duration_ms = f->last_seen_ms - f->first_seen_ms;
+        uint32_t duration_sec = duration_ms / 1000;
+        char proto_name[64];
+        ndpi_protocol2name(ndpi_module, f->detected_protocol.proto, proto_name, sizeof(proto_name));
+
+        uint64_t bytes_per_sec = (duration_ms > 0) ? (f->bytes * 1000 / duration_ms) : 0;
+
+        log_debug("FLOW_END: %s | %s:%d -> %s:%d | %lu bytes | %u sec | %lu KB/s",
+                  proto_name, src_str, ntohs(f->src_port),
+                  dst_str, ntohs(f->dst_port), f->bytes, duration_sec, bytes_per_sec / 1000);
+    }
+    /* Note: Quota is tracked via session-based timing, not flow duration */
 }
 
 /* Process expired flows */
 static void expire_flows(void) {
     uint64_t now_ms = get_packet_time_ms();
-
-    for (int i = 0; i < MAX_FLOWS; i++) {
-        struct flow_info *f = &flows[i];
-        if (!f->in_use) continue;
-
-        if ((now_ms - f->last_seen_ms) > (FLOW_IDLE_TIMEOUT * 1000)) {
-            /* Flow expired - log if streaming category (debug level) */
-            if (f->detection_completed && is_trackable_traffic(f->detected_protocol)) {
-                char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
-                struct in_addr src_addr = { .s_addr = f->src_ip };
-                struct in_addr dst_addr = { .s_addr = f->dst_ip };
-                inet_ntop(AF_INET, &src_addr, src_str, sizeof(src_str));
-                inet_ntop(AF_INET, &dst_addr, dst_str, sizeof(dst_str));
-
-                uint64_t duration_ms = f->last_seen_ms - f->first_seen_ms;
-                uint32_t duration_sec = duration_ms / 1000;
-                char proto_name[64];
-                ndpi_protocol2name(ndpi_module, f->detected_protocol.proto, proto_name, sizeof(proto_name));
-
-                uint64_t bytes_per_sec = (duration_ms > 0) ? (f->bytes * 1000 / duration_ms) : 0;
-
-                log_debug("FLOW_END: %s | %s:%d -> %s:%d | %lu bytes | %u sec | %lu KB/s",
-                          proto_name, src_str, ntohs(f->src_port),
-                          dst_str, ntohs(f->dst_port), f->bytes, duration_sec, bytes_per_sec / 1000);
-            }
-            /* Note: Quota is now tracked via session-based timing, not flow duration */
-            free_flow(f);
-        }
-    }
+    flow_table_expire(&g_flow_table, now_ms, FLOW_IDLE_TIMEOUT * 1000,
+                      on_flow_expire, NULL);
 }
 
 /* Check for streaming session timeouts and quota violations */
 static void check_session_timeouts(void) {
     uint64_t now_ms = get_packet_time_ms();
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].in_use || clients[i].session_start_ms == 0)
             continue;
 
@@ -621,8 +557,8 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
     /* Update pcap time from packet timestamp (for replay mode) */
     pcap_time_ms = (uint64_t)header->ts.tv_sec * 1000 + header->ts.tv_usec / 1000;
 
-    /* Skip ethernet header (14 bytes) */
-    const struct ip *ip_header = (const struct ip *)(packet + 14);
+    /* Skip ethernet header */
+    const struct ip *ip_header = (const struct ip *)(packet + ETHERNET_HEADER_SIZE);
 
     if (ip_header->ip_v != 4) return;  /* IPv4 only for now */
 
@@ -632,7 +568,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
     uint16_t src_port = 0, dst_port = 0;
 
     int ip_header_len = ip_header->ip_hl * 4;
-    const u_char *transport = packet + 14 + ip_header_len;
+    const u_char *transport = packet + ETHERNET_HEADER_SIZE + ip_header_len;
 
     if (protocol == IPPROTO_TCP) {
         const struct tcphdr *tcp = (const struct tcphdr *)transport;
@@ -651,7 +587,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
 
     /* Get or create flow */
     int is_new;
-    struct flow_info *flow = get_flow(src_ip, dst_ip, src_port, dst_port, protocol, &is_new);
+    struct flow_entry *flow = get_flow(src_ip, dst_ip, src_port, dst_port, protocol, &is_new);
     if (!flow) return;
 
     flow->packets++;
@@ -682,7 +618,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
 
         /* QUIC needs more packets for sub-classification */
         int is_quic = (master == NDPI_PROTOCOL_QUIC || app == NDPI_PROTOCOL_QUIC);
-        uint32_t max_packets = is_quic ? 32 : 10;  /* More packets for QUIC */
+        uint32_t max_packets = is_quic ? NDPI_QUIC_MAX_PACKETS : NDPI_DEFAULT_MAX_PACKETS;
 
         /* Detection complete when:
          * - App protocol identified (not just master), OR
@@ -825,7 +761,7 @@ void test_set_state_file_path(const char *path) {
 }
 
 void test_init_client(int idx, uint32_t ip, uint64_t seconds, const char *date) {
-    if (idx < 0 || idx >= 256) return;
+    if (idx < 0 || idx >= MAX_CLIENTS) return;
     clients[idx].ip = ip;
     clients[idx].streaming_seconds = seconds;
     clients[idx].in_use = 1;
@@ -836,14 +772,14 @@ void test_init_client(int idx, uint32_t ip, uint64_t seconds, const char *date) 
 }
 
 void test_get_client(int idx, uint32_t *ip, uint64_t *seconds, int *blocked) {
-    if (idx < 0 || idx >= 256) return;
+    if (idx < 0 || idx >= MAX_CLIENTS) return;
     if (ip) *ip = clients[idx].ip;
     if (seconds) *seconds = clients[idx].streaming_seconds;
     if (blocked) *blocked = clients[idx].is_blocked;
 }
 
 int test_client_in_use(int idx) {
-    if (idx < 0 || idx >= 256) return 0;
+    if (idx < 0 || idx >= MAX_CLIENTS) return 0;
     return clients[idx].in_use;
 }
 
@@ -858,6 +794,9 @@ int main(int argc, char *argv[]) {
     char *mask = LAN_MASK;
     char errbuf[PCAP_ERRBUF_SIZE];
     int opt;
+
+    /* Initialize global context with defaults */
+    streamguard_ctx_init(&g_ctx);
 
     while ((opt = getopt(argc, argv, "i:r:s:m:q:f:R:u:k:F:U:L:eVdh")) != -1) {
         switch (opt) {
@@ -969,8 +908,8 @@ int main(int argc, char *argv[]) {
 #if RPCAP_ENABLED
         if (strncmp(input_pcap, "rpcap://", 8) == 0) {
             /* Remote capture via rpcapd - requires libpcap built with --enable-remote */
-            pcap_handle = pcap_open(input_pcap, 1600, PCAP_OPENFLAG_PROMISCUOUS,
-                                    100, NULL, errbuf);
+            pcap_handle = pcap_open(input_pcap, PCAP_SNAPLEN, PCAP_OPENFLAG_PROMISCUOUS,
+                                    PCAP_TIMEOUT_MS, NULL, errbuf);
             if (!pcap_handle) {
                 log_fatal("pcap_open (rpcap) failed: %s", errbuf);
                 return 1;
@@ -978,7 +917,7 @@ int main(int argc, char *argv[]) {
 
             /* Set BPF filter for HTTP/HTTPS/QUIC */
             struct bpf_program fp;
-            if (pcap_compile(pcap_handle, &fp, "port 80 or port 443", 1, PCAP_NETMASK_UNKNOWN) == 0) {
+            if (pcap_compile(pcap_handle, &fp, BPF_FILTER, 1, PCAP_NETMASK_UNKNOWN) == 0) {
                 pcap_setfilter(pcap_handle, &fp);
                 pcap_freecode(&fp);
             }
@@ -1002,7 +941,7 @@ int main(int argc, char *argv[]) {
                      strcmp(input_pcap, "-") == 0 ? "stdin" : input_pcap);
         }
     } else {
-        pcap_handle = pcap_open_live(interface, 1600, 1, 100, errbuf);
+        pcap_handle = pcap_open_live(interface, PCAP_SNAPLEN, 1, PCAP_TIMEOUT_MS, errbuf);
         if (!pcap_handle) {
             log_fatal("pcap_open_live failed: %s", errbuf);
             return 1;
@@ -1010,7 +949,7 @@ int main(int argc, char *argv[]) {
 
         /* Set filter for HTTP/HTTPS/QUIC (only for live capture) */
         struct bpf_program fp;
-        if (pcap_compile(pcap_handle, &fp, "port 80 or port 443", 1, PCAP_NETMASK_UNKNOWN) == 0) {
+        if (pcap_compile(pcap_handle, &fp, BPF_FILTER, 1, PCAP_NETMASK_UNKNOWN) == 0) {
             pcap_setfilter(pcap_handle, &fp);
             pcap_freecode(&fp);
         }
@@ -1064,7 +1003,7 @@ int main(int argc, char *argv[]) {
 
     /* End any active streaming sessions */
     uint64_t now_ms = get_packet_time_ms();
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].in_use && clients[i].session_start_ms != 0) {
             /* Session was active - count time up to now */
             uint64_t duration_sec =
@@ -1082,16 +1021,13 @@ int main(int argc, char *argv[]) {
     save_state();
 
     /* Final expiration to log remaining flows (debug mode only) */
-    for (int i = 0; i < MAX_FLOWS; i++) {
-        if (flows[i].in_use) {
-            flows[i].last_seen_ms = now_ms - (FLOW_IDLE_TIMEOUT * 1000) - 1;
-        }
-    }
-    expire_flows();
+    /* Force all flows to expire by using a timestamp far in the future */
+    flow_table_expire(&g_flow_table, now_ms + (FLOW_IDLE_TIMEOUT * 1000) + 1,
+                      FLOW_IDLE_TIMEOUT * 1000, on_flow_expire, NULL);
 
     /* Print final quotas */
     log_info("=== Final Quota Summary ===");
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].in_use) {
             log_info("%s: %lu seconds (%.1f minutes)",
                      ip_to_str(clients[i].ip), clients[i].streaming_seconds,

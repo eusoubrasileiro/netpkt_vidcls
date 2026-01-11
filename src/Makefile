@@ -5,7 +5,7 @@ CC = gcc
 # Use local nDPI build (../nDPI) if available, otherwise system pkg-config
 NDPI_LOCAL = ../nDPI
 ifneq ($(wildcard $(NDPI_LOCAL)/src/lib/libndpi.a),)
-    NDPI_CFLAGS = -I$(NDPI_LOCAL)/src/include
+    NDPI_CFLAGS = -I$(NDPI_LOCAL)/src/include -I$(NDPI_LOCAL)/src/lib/third_party/include
     NDPI_LIBS = $(NDPI_LOCAL)/src/lib/libndpi.a -lm -lpthread -lgcrypt -lgpg-error
 else
     NDPI_CFLAGS = $(shell pkg-config --cflags libndpi)
@@ -26,8 +26,8 @@ CFLAGS = -Wall -Wextra -O2 $(NDPI_CFLAGS) $(PCAP_CFLAGS)
 LDFLAGS = $(NDPI_LIBS) $(PCAP_LIBS) -lcjson
 
 TARGET = streamguard
-SRCS = streamguard.c log.c
-OBJS = streamguard.o log.o
+SRCS = streamguard.c log.c flow_table.c
+OBJS = streamguard.o log.o flow_table.o
 
 all: $(TARGET)
 

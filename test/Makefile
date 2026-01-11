@@ -5,7 +5,7 @@ CC = gcc
 # nDPI paths (same logic as src/Makefile)
 NDPI_LOCAL = ../nDPI
 ifneq ($(wildcard $(NDPI_LOCAL)/src/lib/libndpi.a),)
-    NDPI_CFLAGS = -I$(NDPI_LOCAL)/src/include
+    NDPI_CFLAGS = -I$(NDPI_LOCAL)/src/include -I$(NDPI_LOCAL)/src/lib/third_party/include
     NDPI_LIBS = $(NDPI_LOCAL)/src/lib/libndpi.a -lm -lpthread -lgcrypt -lgpg-error
 else
     NDPI_CFLAGS = $(shell pkg-config --cflags libndpi)
@@ -24,6 +24,8 @@ STREAMGUARD_SRC = ../src/streamguard.c
 STREAMGUARD_OBJ = streamguard_test.o
 LOG_SRC = ../src/log.c
 LOG_OBJ = log_test.o
+FLOW_TABLE_SRC = ../src/flow_table.c
+FLOW_TABLE_OBJ = flow_table.o
 
 # Unit test files
 UNIT_SRCS = $(wildcard unit/*.c)
@@ -41,9 +43,13 @@ $(STREAMGUARD_OBJ): $(STREAMGUARD_SRC)
 $(LOG_OBJ): $(LOG_SRC)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Build flow_table.c as object file
+$(FLOW_TABLE_OBJ): $(FLOW_TABLE_SRC)
+	$(CC) $(CFLAGS) -I../src -c -o $@ $<
+
 # Build each unit test binary
-unit/%: unit/%.c $(STREAMGUARD_OBJ) $(LOG_OBJ)
-	$(CC) $(CFLAGS) -I../src -o $@ $< $(STREAMGUARD_OBJ) $(LOG_OBJ) $(LDFLAGS)
+unit/%: unit/%.c $(STREAMGUARD_OBJ) $(LOG_OBJ) $(FLOW_TABLE_OBJ)
+	$(CC) $(CFLAGS) -I../src -o $@ $< $(STREAMGUARD_OBJ) $(LOG_OBJ) $(FLOW_TABLE_OBJ) $(LDFLAGS)
 
 # Build all unit tests
 unit: $(UNIT_BINS)
@@ -74,4 +80,4 @@ tap: unit
 	done
 
 clean:
-	rm -f $(STREAMGUARD_OBJ) $(UNIT_BINS)
+	rm -f $(STREAMGUARD_OBJ) $(LOG_OBJ) $(FLOW_TABLE_OBJ) $(UNIT_BINS)
