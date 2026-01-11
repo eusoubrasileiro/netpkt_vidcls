@@ -46,6 +46,9 @@
 #define SAVE_INTERVAL 60  /* seconds */
 #define FLOW_IDLE_TIMEOUT 30  /* seconds */
 #define SESSION_TIMEOUT 45000  /* 45 seconds - based on YouTube's ~30s buffer */
+#define BLOCK_INITIAL_BACKOFF_MS  5000    /* 5 sec initial retry */
+#define BLOCK_MAX_BACKOFF_MS      300000  /* 5 min max backoff */
+#define NEXT_BACKOFF(b) ((b) * 2 > BLOCK_MAX_BACKOFF_MS ? BLOCK_MAX_BACKOFF_MS : (b) * 2)
 #define LAN_SUBNET "192.168.0.0"
 #define LAN_MASK "255.255.255.0"
 
@@ -80,10 +83,13 @@ struct client_info {
     /* Session-based tracking */
     uint64_t session_start_ms;          /* When current session started (0 = inactive) */
     uint64_t last_streaming_activity_ms; /* Last streaming packet timestamp */
+    /* Block retry with exponential backoff */
+    uint64_t block_retry_after_ms;      /* 0 = no retry needed, >0 = retry at this time */
+    uint32_t block_backoff_ms;          /* Current backoff (doubles each failure) */
 };
 
 /* Get current time in milliseconds (wall clock) */
-static uint64_t get_time_ms(void) {
+static uint64_t get_wall_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -116,11 +122,11 @@ static char *log_file_path = NULL;  /* -L: Log file path (optional) */
 static FILE *log_file_fp = NULL;    /* Log file pointer */
 
 /* Get current time - uses pcap timestamps when replaying, wall clock otherwise */
-static uint64_t get_current_time_ms(void) {
+static uint64_t get_packet_time_ms(void) {
     if (input_pcap != NULL && pcap_time_ms > 0) {
         return pcap_time_ms;
     }
-    return get_time_ms();
+    return get_wall_time_ms();
 }
 
 /* Check if protocol is a social media platform (Instagram, Facebook) */
@@ -165,6 +171,12 @@ static const char *ip_to_str(uint32_t ip) {
 /* Get client index from IP (assumes /24) */
 STATIC int get_client_index(uint32_t ip) {
     return ntohl(ip) & 0xFF;  /* Extract last octet in host byte order */
+}
+
+/* Reset client session state */
+static inline void reset_client_session(int idx) {
+    clients[idx].session_start_ms = 0;
+    clients[idx].last_streaming_activity_ms = 0;
 }
 
 /* Get current date as YYYY-MM-DD string */
@@ -228,18 +240,27 @@ static void add_streaming_destination(uint32_t dest_ip) {
 static void block_client(uint32_t client_ip) {
     const char *ip_str = ip_to_str(client_ip);
     int idx = get_client_index(client_ip);
-    if (clients[idx].is_blocked) return;  /* Already blocked */
+    if (clients[idx].is_blocked) return;  /* Already blocked or pending retry */
 
     if (enforce_mode) {
         int ret = execute_firewall_command("add", "blocked_streaming_clients", ip_str);
         if (ret == 0) {
             clients[idx].is_blocked = 1;
+            clients[idx].block_retry_after_ms = 0;  /* No retry needed */
+            clients[idx].block_backoff_ms = 0;
             log_warn("BLOCKED: %s (quota exceeded: %lu/%lu seconds)%s",
                      ip_str, clients[idx].streaming_seconds, daily_quota,
                      router_ip ? " [remote]" : "");
         } else {
-            log_error("Failed to block %s (%s returned %d)",
-                      ip_str, router_ip ? "SSH" : firewall_type, ret);
+            /* Schedule retry with exponential backoff */
+            uint64_t now_ms = get_wall_time_ms();
+            uint32_t backoff = clients[idx].block_backoff_ms;
+            if (backoff == 0) backoff = BLOCK_INITIAL_BACKOFF_MS;
+            clients[idx].is_blocked = 1;  /* Prevent per-packet spam */
+            clients[idx].block_retry_after_ms = now_ms + backoff;
+            clients[idx].block_backoff_ms = NEXT_BACKOFF(backoff);
+            log_error("Failed to block %s (%s returned %d), retry in %u sec",
+                      ip_str, router_ip ? "SSH" : firewall_type, ret, backoff / 1000);
         }
     } else {
         log_info("DRY-RUN: Would block %s (quota exceeded: %lu/%lu seconds)",
@@ -265,6 +286,34 @@ static void unblock_client(uint32_t client_ip) {
         }
     } else {
         log_info("DRY-RUN: Would unblock %s (daily reset)", ip_str);
+    }
+}
+
+/* Retry pending blocks with exponential backoff */
+static void retry_pending_blocks(void) {
+    uint64_t now_ms = get_wall_time_ms();
+
+    for (int i = 0; i < 256; i++) {
+        if (!clients[i].in_use || !clients[i].is_blocked) continue;
+        if (clients[i].block_retry_after_ms == 0) continue;  /* Already blocked */
+        if (now_ms < clients[i].block_retry_after_ms) continue;  /* Not time yet */
+
+        const char *ip_str = ip_to_str(clients[i].ip);
+        int ret = execute_firewall_command("add", "blocked_streaming_clients", ip_str);
+
+        if (ret == 0) {
+            clients[i].block_retry_after_ms = 0;
+            clients[i].block_backoff_ms = 0;
+            log_warn("BLOCKED: %s (retry succeeded)%s",
+                     ip_str, router_ip ? " [remote]" : "");
+        } else {
+            /* Schedule next retry with increased backoff */
+            uint32_t backoff = clients[i].block_backoff_ms;
+            clients[i].block_retry_after_ms = now_ms + backoff;
+            clients[i].block_backoff_ms = NEXT_BACKOFF(backoff);
+            log_error("Retry block %s failed (%s returned %d), next retry in %u sec",
+                      ip_str, router_ip ? "SSH" : firewall_type, ret, backoff / 1000);
+        }
     }
 }
 
@@ -444,7 +493,7 @@ static struct flow_info *get_flow(uint32_t src_ip, uint32_t dst_ip,
             f->src_port = norm_port1;
             f->dst_port = norm_port2;
             f->protocol = protocol;
-            f->first_seen_ms = get_current_time_ms();
+            f->first_seen_ms = get_packet_time_ms();
             f->last_seen_ms = f->first_seen_ms;
             f->in_use = 1;
 
@@ -460,7 +509,7 @@ static struct flow_info *get_flow(uint32_t src_ip, uint32_t dst_ip,
         if (f->src_ip == norm_ip1 && f->dst_ip == norm_ip2 &&
             f->src_port == norm_port1 && f->dst_port == norm_port2 &&
             f->protocol == protocol) {
-            f->last_seen_ms = get_current_time_ms();
+            f->last_seen_ms = get_packet_time_ms();
             return f;
         }
 
@@ -478,7 +527,7 @@ static void free_flow(struct flow_info *f) {
 
 /* Process expired flows */
 static void expire_flows(void) {
-    uint64_t now_ms = get_current_time_ms();
+    uint64_t now_ms = get_packet_time_ms();
 
     for (int i = 0; i < MAX_FLOWS; i++) {
         struct flow_info *f = &flows[i];
@@ -512,7 +561,7 @@ static void expire_flows(void) {
 
 /* Check for streaming session timeouts and quota violations */
 static void check_session_timeouts(void) {
-    uint64_t now_ms = get_current_time_ms();
+    uint64_t now_ms = get_packet_time_ms();
 
     for (int i = 0; i < 256; i++) {
         if (!clients[i].in_use || clients[i].session_start_ms == 0)
@@ -520,6 +569,13 @@ static void check_session_timeouts(void) {
 
         if ((now_ms - clients[i].last_streaming_activity_ms) > SESSION_TIMEOUT) {
             /* Session ended due to inactivity */
+
+            /* Skip accumulation if already blocked - just reset session */
+            if (clients[i].is_blocked) {
+                reset_client_session(i);
+                continue;
+            }
+
             uint64_t duration_sec =
                 (clients[i].last_streaming_activity_ms - clients[i].session_start_ms) / 1000;
             clients[i].streaming_seconds += duration_sec;
@@ -529,7 +585,7 @@ static void check_session_timeouts(void) {
                      ip_to_str(clients[i].ip), duration_sec, clients[i].streaming_seconds, daily_quota,
                      clients[i].streaming_seconds / 60.0, pct);
 
-            clients[i].session_start_ms = 0;  /* Reset session */
+            reset_client_session(i);
 
             /* Check if quota exceeded */
             if (clients[i].streaming_seconds >= daily_quota) {
@@ -552,6 +608,9 @@ static void check_session_timeouts(void) {
             }
         }
     }
+
+    /* Retry any pending blocks */
+    retry_pending_blocks();
 }
 
 /* Packet callback */
@@ -669,7 +728,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
                 /* Update session tracking for this client */
                 uint32_t client_ip = is_lan_ip(src_ip) ? src_ip : dst_ip;
                 int idx = get_client_index(client_ip);
-                uint64_t now_ms = get_current_time_ms();
+                uint64_t now_ms = get_packet_time_ms();
 
                 clients[idx].ip = client_ip;
                 clients[idx].in_use = 1;
@@ -700,7 +759,7 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *header,
         uint32_t client_ip = is_lan_ip(flow->src_ip) ? flow->src_ip : flow->dst_ip;
         int idx = get_client_index(client_ip);
         if (clients[idx].session_start_ms != 0) {
-            clients[idx].last_streaming_activity_ms = get_current_time_ms();
+            clients[idx].last_streaming_activity_ms = get_packet_time_ms();
         }
     }
 }
@@ -1004,7 +1063,7 @@ int main(int argc, char *argv[]) {
     log_info("Shutting down...");
 
     /* End any active streaming sessions */
-    uint64_t now_ms = get_current_time_ms();
+    uint64_t now_ms = get_packet_time_ms();
     for (int i = 0; i < 256; i++) {
         if (clients[i].in_use && clients[i].session_start_ms != 0) {
             /* Session was active - count time up to now */
