@@ -225,15 +225,17 @@ static void unblock_client(uint32_t client_ip) {
 
     if (enforce_mode) {
         int ret = execute_firewall_command("del", "blocked_streaming_clients", ip_str);
+        clients[idx].is_blocked = 0;  /* Always clear - daily reset gives fresh start */
         if (ret == 0) {
-            clients[idx].is_blocked = 0;
             log_info("UNBLOCKED: %s (daily reset)%s",
                      ip_str, router_ip ? " [remote]" : "");
         } else {
-            log_error("Failed to unblock %s (%s returned %d)",
-                      ip_str, router_ip ? "SSH" : firewall_type, ret);
+            /* Non-zero is OK - IP might not have been in set */
+            log_debug("Unblock %s returned %d (may not have been blocked)",
+                      ip_str, ret);
         }
     } else {
+        clients[idx].is_blocked = 0;  /* Clear in dry-run mode too */
         log_info("DRY-RUN: Would unblock %s (daily reset)", ip_str);
     }
 }
@@ -737,6 +739,10 @@ int main(int argc, char *argv[]) {
     inet_pton(AF_INET, mask, &lan_netmask);
     lan_network &= lan_netmask;
 
+    /* Determine capture mode: rpcap:// and interfaces are live, files are replay */
+    g_ctx.is_live_capture = (interface != NULL) ||
+                            (input_pcap != NULL && strncmp(input_pcap, "rpcap://", 8) == 0);
+
     log_info("StreamGuard - Video Streaming Quota Enforcement");
     const char *tracking_mode = video_only_mode ? "VIDEO-ONLY" : "ALL-SOCIAL";
     const char *exec_mode = enforce_mode ? "ENFORCE" : "DRY-RUN";
@@ -844,8 +850,8 @@ int main(int argc, char *argv[]) {
         int ret = pcap_next_ex(pcap_handle, &header, &packet);
         if (ret == 1) {
             packet_handler(NULL, header, packet);
-            /* In replay mode, check session timeouts after each packet */
-            if (input_pcap != NULL) {
+            /* In file replay mode, check session timeouts after each packet */
+            if (!g_ctx.is_live_capture) {
                 check_session_timeouts();
             }
         } else if (ret == -2) {
@@ -856,8 +862,8 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        /* Periodic maintenance (live capture only) */
-        if (input_pcap == NULL) {
+        /* Periodic maintenance (live capture only - includes rpcap://) */
+        if (g_ctx.is_live_capture) {
             time_t now = time(NULL);
             if (now - last_expire >= 5) {
                 expire_flows();

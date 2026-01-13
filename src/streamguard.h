@@ -94,6 +94,7 @@ struct streamguard_ctx {
     int enforce_mode;       /* 0=dry-run, 1=enforce */
     int debug_mode;         /* 0=normal, 1=verbose debug output */
     int video_only_mode;    /* 0=all social media, 1=video streaming only */
+    int is_live_capture;    /* 1=live/rpcap, 0=file replay */
 
     /* Quota settings */
     uint64_t daily_quota;   /* seconds */

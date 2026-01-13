@@ -1,0 +1,19 @@
+[Unit]
+Description=StreamGuard Web Interface
+After=network.target streamguard.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/local/lib/streamguard-web
+ExecStart=/usr/bin/python3 /usr/local/lib/streamguard-web/app.py
+
+Environment=STREAMGUARD_STATE_FILE=/var/lib/streamguard/state.json
+Environment=STREAMGUARD_QUOTA=1800
+Environment=PORT=8080
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

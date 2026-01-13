@@ -37,6 +37,8 @@ Ubuntu Machine (StreamGuard)              OpenWrt Router
 | `src/Makefile` | Build system (auto-detects local nDPI/libpcap) |
 | `scripts/openwrt/install.sh` | Deploy to router (firewall + rpcapd) |
 | `scripts/streamguard.service` | Systemd service (Ubuntu) |
+| `scripts/web/app.py` | Web dashboard (Flask) |
+| `scripts/streamguard-web.service` | Web interface systemd service |
 
 ## Build and Run
 
@@ -174,6 +176,68 @@ Use `-d` for debug output, `-L <file>` to log to file.
 cd src
 make test          # All tests
 make test-unit     # Unit tests only
+```
+
+## Web Interface
+
+A Flask-based web dashboard for viewing client quota status.
+
+### Features
+- Real-time quota dashboard at `http://localhost:8080`
+- Progress bars with color coding (green/yellow/red)
+- JSON API for integration
+
+### Installation
+
+```bash
+# Install Flask
+pip3 install flask
+
+# Copy web app
+sudo mkdir -p /usr/local/lib/streamguard-web
+sudo cp scripts/web/app.py /usr/local/lib/streamguard-web/
+
+# Install and start service
+sudo cp scripts/streamguard-web.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now streamguard-web
+```
+
+### Configuration
+
+Environment variables (set in systemd service):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STREAMGUARD_STATE_FILE` | `/var/lib/streamguard/state.json` | Path to state file |
+| `STREAMGUARD_QUOTA` | `3600` | Daily quota in seconds |
+| `PORT` | `8080` | Web server port |
+
+### API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | HTML dashboard |
+| `GET /api/clients` | JSON list of all clients with quota info |
+| `GET /api/clients/<ip>` | JSON data for specific client |
+
+**Example API response:**
+```json
+{
+  "clients": [
+    {
+      "ip": "192.168.0.25",
+      "streaming_seconds": 1234,
+      "quota_seconds": 1800,
+      "remaining_seconds": 566,
+      "percentage_used": 68.6,
+      "is_blocked": false,
+      "color": "yellow"
+    }
+  ],
+  "quota_seconds": 1800,
+  "timestamp": "2026-01-13T16:50:00"
+}
 ```
 
 ## Known Issues
