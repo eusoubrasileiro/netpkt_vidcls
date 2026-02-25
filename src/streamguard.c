@@ -268,6 +268,59 @@ static void retry_pending_blocks(void) {
     }
 }
 
+/* Re-sync blocked clients to router firewall on startup.
+ * After loading state, block_retry_after_ms is 0 (not persisted), so
+ * retry_pending_blocks() skips these clients. This function re-pushes
+ * legitimately blocked clients to the router and clears inconsistent state. */
+static void resync_blocked_clients(void) {
+    int resynced = 0, cleared = 0;
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].in_use || !clients[i].is_blocked) continue;
+
+        const char *ip_str = ip_to_str(clients[i].ip);
+
+        /* Inconsistent state: blocked but hasn't reached quota */
+        if (clients[i].streaming_seconds < daily_quota) {
+            log_warn("RESYNC: %s cleared inconsistent block "
+                     "(streaming_seconds=%lu < quota=%lu)",
+                     ip_str, clients[i].streaming_seconds, daily_quota);
+            clients[i].is_blocked = 0;
+            clients[i].block_retry_after_ms = 0;
+            clients[i].block_backoff_ms = 0;
+            cleared++;
+            continue;
+        }
+
+        /* Legitimate block - re-push to router */
+        if (enforce_mode) {
+            int ret = execute_firewall_command("add", "blocked_streaming_clients", ip_str);
+            if (ret == 0) {
+                clients[i].block_retry_after_ms = 0;
+                clients[i].block_backoff_ms = 0;
+                log_info("RESYNC: %s re-blocked on router (%lu/%lu sec)",
+                         ip_str, clients[i].streaming_seconds, daily_quota);
+            } else {
+                /* Let retry loop handle it */
+                uint64_t now_ms = get_wall_time_ms();
+                clients[i].block_retry_after_ms = now_ms + BLOCK_INITIAL_BACKOFF_MS;
+                clients[i].block_backoff_ms = NEXT_BACKOFF(BLOCK_INITIAL_BACKOFF_MS);
+                log_error("RESYNC: %s re-block failed (ret=%d), scheduled for retry",
+                          ip_str, ret);
+            }
+        } else {
+            log_info("RESYNC: %s would be re-blocked (dry-run, %lu/%lu sec)",
+                     ip_str, clients[i].streaming_seconds, daily_quota);
+        }
+        resynced++;
+    }
+
+    if (resynced > 0 || cleared > 0) {
+        log_info("RESYNC: %d client(s) re-blocked, %d inconsistent cleared",
+                 resynced, cleared);
+    }
+}
+
 /* Save state to JSON file - wrapper around state module */
 STATIC void save_state(void) {
     state_save(clients, MAX_CLIENTS, state_file_path, &last_state_save);
@@ -782,6 +835,7 @@ int main(int argc, char *argv[]) {
     /* Load previous state and check for daily reset */
     load_state();
     check_daily_reset();
+    resync_blocked_clients();
 
     /* Open pcap - rpcap:// URL, local file, stdin, or live interface */
     if (input_pcap) {
